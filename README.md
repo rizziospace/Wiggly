@@ -4,6 +4,10 @@ Wiggly is an experimental, open-source animated drawing app for iPad. It combine
 
 > Wiggly currently targets iPadOS 26 and is under active development. Test drawing performance and Apple Pencil behavior on a physical iPad.
 
+## Demo
+
+![Wiggly animated drawing demo](Media/Wiggly.gif)
+
 ## Features
 
 - Apple Pencil pressure, tilt, azimuth, coalesced input, and palm rejection
