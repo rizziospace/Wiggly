@@ -9,6 +9,8 @@ final class AnimatedMetalView: MTKView, MTKViewDelegate, UIGestureRecognizerDele
             if oldValue.id != document.id || oldValue.modifiedAt != document.modifiedAt {
                 cachedDocumentFrame = nil
                 committedStrokePreview = nil
+                updatePreferredFrameRate()
+                requestDisplay()
             }
         }
     }
@@ -16,6 +18,13 @@ final class AnimatedMetalView: MTKView, MTKViewDelegate, UIGestureRecognizerDele
     var inputPolicy = CanvasInputPolicy.pencilOnly
     var isErasing = false
     var isSelecting = false
+    var isAnimationPlaying = true {
+        didSet {
+            guard oldValue != isAnimationPlaying else { return }
+            cachedDocumentFrame = nil
+            configureDisplayMode()
+        }
+    }
     var isTransformingImage = false {
         didSet {
             if oldValue != isTransformingImage { updateGestureAvailability() }
@@ -25,6 +34,7 @@ final class AnimatedMetalView: MTKView, MTKViewDelegate, UIGestureRecognizerDele
     var onStroke: ((AnimatedStroke) -> Void)?
     var onErase: ((CGPoint) -> Void)?
     var onSelect: ((CGPoint) -> Void)?
+    var onPickColor: ((CodableColor) -> Void)?
     var onUndo: (() -> Void)?
     var onRedo: (() -> Void)?
     var onImageTransformBegan: (() -> Void)?
@@ -61,6 +71,9 @@ final class AnimatedMetalView: MTKView, MTKViewDelegate, UIGestureRecognizerDele
     private var isPinching = false
     private var isRotating = false
     private var activeImageTransformGestures = 0
+    private var colorSamplingFrame: CGImage?
+    private var colorPickIndicator: CAShapeLayer?
+    private var lastPickedColor: CodableColor?
 
     override init(frame: CGRect, device: MTLDevice?) {
         let metalDevice = device ?? MTLCreateSystemDefaultDevice()
@@ -72,7 +85,7 @@ final class AnimatedMetalView: MTKView, MTKViewDelegate, UIGestureRecognizerDele
         framebufferOnly = false
         enableSetNeedsDisplay = false
         isPaused = false
-        preferredFramesPerSecond = 60
+        preferredFramesPerSecond = 30
         colorPixelFormat = .bgra8Unorm
         clearColor = MTLClearColorMake(0.075, 0.072, 0.085, 1)
         isMultipleTouchEnabled = true
@@ -102,6 +115,14 @@ final class AnimatedMetalView: MTKView, MTKViewDelegate, UIGestureRecognizerDele
         imagePanGesture.delegate = self
         imagePanGesture.isEnabled = false
         addGestureRecognizer(imagePanGesture)
+
+        let colorPick = UILongPressGestureRecognizer(target: self, action: #selector(colorPicked(_:)))
+        colorPick.minimumPressDuration = 0.35
+        colorPick.allowableMovement = 18
+        colorPick.allowedTouchTypes = [NSNumber(value: UITouch.TouchType.direct.rawValue)]
+        colorPick.cancelsTouchesInView = true
+        colorPick.delegate = self
+        addGestureRecognizer(colorPick)
 
         let pinch = UIPinchGestureRecognizer(target: self, action: #selector(pinched(_:)))
         pinch.allowedTouchTypes = [NSNumber(value: UITouch.TouchType.direct.rawValue)]
@@ -137,6 +158,25 @@ final class AnimatedMetalView: MTKView, MTKViewDelegate, UIGestureRecognizerDele
         rotateGesture.isEnabled = !isTransformingImage
     }
 
+    private func configureDisplayMode() {
+        enableSetNeedsDisplay = !isAnimationPlaying
+        isPaused = !isAnimationPlaying
+        updatePreferredFrameRate()
+        requestDisplay()
+    }
+
+    private func updatePreferredFrameRate() {
+        guard isAnimationPlaying else { return }
+        let sampleCount = document.layers.reduce(0) { layerTotal, layer in
+            layerTotal + layer.strokes.reduce(0) { $0 + $1.samples.count }
+        }
+        preferredFramesPerSecond = sampleCount > 20_000 ? 15 : (sampleCount > 8_000 ? 24 : 30)
+    }
+
+    private func requestDisplay() {
+        if !isAnimationPlaying { setNeedsDisplay() }
+    }
+
     private func beginImageTransformGesture() {
         if activeImageTransformGestures == 0 { onImageTransformBegan?() }
         activeImageTransformGestures += 1
@@ -163,6 +203,7 @@ final class AnimatedMetalView: MTKView, MTKViewDelegate, UIGestureRecognizerDele
         offset.x += translation.x
         offset.y += translation.y
         gesture.setTranslation(.zero, in: self)
+        requestDisplay()
     }
 
     @objc private func imagePanned(_ gesture: UIPanGestureRecognizer) {
@@ -217,6 +258,7 @@ final class AnimatedMetalView: MTKView, MTKViewDelegate, UIGestureRecognizerDele
             zoom = min(8, max(0.25, zoom * delta))
             align(canvasPoint: anchor, withViewPoint: location)
             gesture.scale = 1
+            requestDisplay()
         case .ended:
             let duration = CACurrentMediaTime() - pinchStartedAt
             let wasQuickClose = duration < 0.18
@@ -241,6 +283,7 @@ final class AnimatedMetalView: MTKView, MTKViewDelegate, UIGestureRecognizerDele
             rotation += gesture.rotation
             align(canvasPoint: anchor, withViewPoint: location)
             gesture.rotation = 0
+            requestDisplay()
         default:
             isRotating = false
         }
@@ -250,6 +293,7 @@ final class AnimatedMetalView: MTKView, MTKViewDelegate, UIGestureRecognizerDele
         zoom = 1
         rotation = 0
         offset = .zero
+        requestDisplay()
     }
 
     @objc private func twoFingerUndo(_ gesture: UITapGestureRecognizer) {
@@ -260,6 +304,116 @@ final class AnimatedMetalView: MTKView, MTKViewDelegate, UIGestureRecognizerDele
     @objc private func threeFingerRedo(_ gesture: UITapGestureRecognizer) {
         guard gesture.state == .ended else { return }
         onRedo?()
+    }
+
+    @objc private func colorPicked(_ gesture: UILongPressGestureRecognizer) {
+        guard !isTransformingImage else { return }
+        switch gesture.state {
+        case .began:
+            samples.removeAll(keepingCapacity: true)
+            colorSamplingFrame = makeColorSamplingFrame()
+            lastPickedColor = nil
+            updateColorPick(at: gesture.location(in: self))
+            UIImpactFeedbackGenerator(style: .light).impactOccurred()
+            requestDisplay()
+        case .changed:
+            updateColorPick(at: gesture.location(in: self))
+        case .ended, .cancelled, .failed:
+            finishColorPick()
+        default:
+            break
+        }
+    }
+
+    private func makeColorSamplingFrame() -> CGImage? {
+        let maxDimension: CGFloat = 768
+        let sourceWidth = CGFloat(document.width)
+        let sourceHeight = CGFloat(document.height)
+        let scale = min(1, maxDimension / max(sourceWidth, sourceHeight))
+        let elapsed = CACurrentMediaTime() - displayStart
+        let phase = isAnimationPlaying
+            ? elapsed.truncatingRemainder(dividingBy: 3) / 3
+            : 0
+        return AnimatedDrawingRenderer.image(
+            document: document,
+            phase: phase,
+            outputSize: CGSize(
+                width: max(1, sourceWidth * scale),
+                height: max(1, sourceHeight * scale)
+            )
+        )
+    }
+
+    private func updateColorPick(at viewPoint: CGPoint) {
+        let canvasLocation = canvasPoint(from: viewPoint)
+        guard let frame = colorSamplingFrame,
+              let pickedColor = sampledColor(at: canvasLocation, from: frame) else { return }
+
+        updateColorPickIndicator(color: pickedColor, at: viewPoint)
+        if pickedColor != lastPickedColor {
+            lastPickedColor = pickedColor
+            onPickColor?(pickedColor)
+        }
+    }
+
+    private func sampledColor(at point: CGPoint, from image: CGImage) -> CodableColor? {
+        let sourceWidth = CGFloat(document.width)
+        let sourceHeight = CGFloat(document.height)
+        guard point.x >= 0, point.y >= 0,
+              point.x < sourceWidth, point.y < sourceHeight,
+              let data = image.dataProvider?.data,
+              let bytes = CFDataGetBytePtr(data) else { return nil }
+
+        let x = min(image.width - 1, max(0, Int(point.x / sourceWidth * CGFloat(image.width))))
+        let y = min(image.height - 1, max(0, Int(point.y / sourceHeight * CGFloat(image.height))))
+        let offset = y * image.bytesPerRow + x * 4
+        let alpha = Double(bytes[offset + 3]) / 255
+        guard alpha > 0.02 else { return nil }
+        return CodableColor(
+            red: min(1, Double(bytes[offset]) / 255 / alpha),
+            green: min(1, Double(bytes[offset + 1]) / 255 / alpha),
+            blue: min(1, Double(bytes[offset + 2]) / 255 / alpha),
+            alpha: alpha
+        )
+    }
+
+    private func updateColorPickIndicator(color: CodableColor, at point: CGPoint) {
+        let indicator: CAShapeLayer
+        if let colorPickIndicator {
+            indicator = colorPickIndicator
+        } else {
+            indicator = CAShapeLayer()
+            indicator.path = UIBezierPath(ovalIn: CGRect(x: -24, y: -24, width: 48, height: 48)).cgPath
+            indicator.strokeColor = UIColor.white.cgColor
+            indicator.lineWidth = 4
+            indicator.shadowColor = UIColor.black.cgColor
+            indicator.shadowOpacity = 0.45
+            indicator.shadowRadius = 6
+            indicator.shadowOffset = CGSize(width: 0, height: 3)
+            layer.addSublayer(indicator)
+            colorPickIndicator = indicator
+        }
+
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        indicator.position = CGPoint(
+            x: min(bounds.width - 28, max(28, point.x)),
+            y: min(bounds.height - 28, max(28, point.y - 58))
+        )
+        indicator.fillColor = UIColor(
+            red: color.red,
+            green: color.green,
+            blue: color.blue,
+            alpha: 1
+        ).cgColor
+        CATransaction.commit()
+    }
+
+    private func finishColorPick() {
+        colorSamplingFrame = nil
+        lastPickedColor = nil
+        colorPickIndicator?.removeFromSuperlayer()
+        colorPickIndicator = nil
     }
 
     private var fittedRect: CGRect {
@@ -381,10 +535,12 @@ final class AnimatedMetalView: MTKView, MTKViewDelegate, UIGestureRecognizerDele
         committedStrokePreview = completedStroke
         samples.removeAll(keepingCapacity: true)
         onStroke?(completedStroke)
+        requestDisplay()
     }
 
     override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent?) {
         samples.removeAll()
+        requestDisplay()
     }
 
     private func append(_ touch: UITouch) {
@@ -410,6 +566,7 @@ final class AnimatedMetalView: MTKView, MTKViewDelegate, UIGestureRecognizerDele
             candidate.pressure = last.pressure + (candidate.pressure - last.pressure) * response
         }
         samples.append(candidate)
+        requestDisplay()
     }
 
     func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) {}
@@ -418,11 +575,14 @@ final class AnimatedMetalView: MTKView, MTKViewDelegate, UIGestureRecognizerDele
         guard let drawable = view.currentDrawable, let commandBuffer = commandQueue.makeCommandBuffer() else { return }
         let currentTime = CACurrentMediaTime()
         let elapsed = currentTime - displayStart
-        let phase = elapsed.truncatingRemainder(dividingBy: 3) / 3
+        let phase = isAnimationPlaying
+            ? elapsed.truncatingRemainder(dividingBy: 3) / 3
+            : 0
         let rect = fittedRect
         let nativeScale = contentScaleFactor
         let longestSide = max(1, max(rect.width, rect.height))
-        let renderScale = max(1, min(nativeScale, 1440 / longestSide))
+        let renderLimit: CGFloat = preferredFramesPerSecond <= 15 ? 1024 : 1440
+        let renderScale = max(1, min(nativeScale, renderLimit / longestSide))
         let displayScale = nativeScale / renderScale
         let renderSize = CGSize(
             width: max(1, rect.width * renderScale),
@@ -434,7 +594,11 @@ final class AnimatedMetalView: MTKView, MTKViewDelegate, UIGestureRecognizerDele
 
         let sizeChanged = abs(cachedDocumentRenderSize.width - renderSize.width) > 1
             || abs(cachedDocumentRenderSize.height - renderSize.height) > 1
-        if cachedDocumentFrame == nil || sizeChanged || currentTime - lastDocumentFrameTime >= 1.0 / 30.0 {
+        let canAdvanceDocumentAnimation = isAnimationPlaying
+        let frameInterval = 1.0 / Double(max(1, preferredFramesPerSecond))
+        if cachedDocumentFrame == nil
+            || sizeChanged
+            || (canAdvanceDocumentAnimation && currentTime - lastDocumentFrameTime >= frameInterval) {
             cachedDocumentFrame = autoreleasepool {
                 AnimatedDrawingRenderer.image(
                     document: document,
@@ -514,6 +678,7 @@ struct MetalCanvas: UIViewRepresentable {
         view.inputPolicy = editor.inputPolicy
         view.isErasing = editor.eraserMode
         view.isSelecting = editor.selectionMode
+        view.isAnimationPlaying = editor.isAnimationPlaying
         view.isTransformingImage = editor.imageTransformMode && editor.canTransformSelectedImage
         view.selectedStrokeID = editor.selectedStrokeID
         view.onStroke = { [weak editor] in editor?.addStroke($0) }
@@ -521,6 +686,7 @@ struct MetalCanvas: UIViewRepresentable {
             editor?.erase(at: $0, radius: max(20, editor?.selectedBrush.size ?? 20))
         }
         view.onSelect = { [weak editor] in editor?.select(at: $0) }
+        view.onPickColor = { [weak editor] in editor?.selectedBrush.color = $0 }
         view.onUndo = { [weak editor] in editor?.undo() }
         view.onRedo = { [weak editor] in editor?.redo() }
         view.onImageTransformBegan = { [weak editor] in editor?.beginImageTransformGesture() }

@@ -1550,6 +1550,9 @@ nonisolated enum AnimatedDrawingRenderer {
                 drawImportedImage(image, layer: layer, document: document, opacity: layer.opacity, in: context)
                 context.setAlpha(layer.opacity)
             }
+            for fill in layer.fills ?? [] {
+                drawFill(fill, document: document, phase: phase, in: context)
+            }
             for stroke in layer.strokes {
                 BrushKernelRegistry.kernels[stroke.brush.kind]?.draw(
                     stroke: stroke,

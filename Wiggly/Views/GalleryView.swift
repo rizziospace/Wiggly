@@ -83,24 +83,41 @@ struct GalleryView: View {
     }
 }
 
+private struct DashboardThumbnail: View {
+    let project: ProjectSummary
+    @State private var image: UIImage?
+
+    init(project: ProjectSummary) {
+        self.project = project
+        _image = State(initialValue: UIImage(contentsOfFile: project.thumbnailURL.path))
+    }
+
+    var body: some View {
+        ZStack {
+            RoundedRectangle(cornerRadius: 18)
+                .fill(.white)
+            if let image {
+                Image(uiImage: image)
+                    .resizable()
+                    .scaledToFit()
+            } else {
+                Image(systemName: "scribble.variable")
+                    .font(.system(size: 48))
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .task(id: project.modifiedAt) {
+            image = UIImage(contentsOfFile: project.thumbnailURL.path)
+        }
+    }
+}
+
 private struct ProjectCard: View {
     let project: ProjectSummary
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
-            ZStack {
-                RoundedRectangle(cornerRadius: 18)
-                    .fill(.white)
-                if let image = UIImage(contentsOfFile: project.thumbnailURL.path()) {
-                    Image(uiImage: image)
-                        .resizable()
-                        .scaledToFit()
-                } else {
-                    Image(systemName: "scribble.variable")
-                        .font(.system(size: 48))
-                        .foregroundStyle(.secondary)
-                }
-            }
+            DashboardThumbnail(project: project)
             .aspectRatio(CGFloat(project.width) / CGFloat(project.height), contentMode: .fit)
             .frame(maxWidth: .infinity, minHeight: 180, maxHeight: 260)
             .clipShape(RoundedRectangle(cornerRadius: 18))

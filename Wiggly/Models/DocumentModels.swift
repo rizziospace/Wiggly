@@ -1,7 +1,7 @@
 import Foundation
 import SwiftUI
 
-nonisolated struct CodableColor: Codable, Hashable {
+nonisolated struct CodableColor: Codable, Hashable, Sendable {
     var red: Double
     var green: Double
     var blue: Double
@@ -50,7 +50,7 @@ nonisolated enum CanvasPreset: String, CaseIterable, Identifiable {
     }
 }
 
-nonisolated struct StrokeSample: Codable, Hashable {
+nonisolated struct StrokeSample: Codable, Hashable, Sendable {
     var x: Double
     var y: Double
     var pressure: Double
@@ -61,7 +61,7 @@ nonisolated struct StrokeSample: Codable, Hashable {
     var point: CGPoint { CGPoint(x: x, y: y) }
 }
 
-nonisolated enum BrushKind: String, Codable, CaseIterable, Identifiable {
+nonisolated enum BrushKind: String, Codable, CaseIterable, Identifiable, Sendable {
     case wiggle
     case jitter
     case pulse
@@ -124,7 +124,7 @@ nonisolated enum BrushKind: String, Codable, CaseIterable, Identifiable {
     }
 }
 
-nonisolated enum ScribbleMotionMode: String, Codable, CaseIterable, Identifiable {
+nonisolated enum ScribbleMotionMode: String, Codable, CaseIterable, Identifiable, Sendable {
     case synchronized
     case random
 
@@ -137,7 +137,7 @@ nonisolated enum ScribbleMotionMode: String, Codable, CaseIterable, Identifiable
     }
 }
 
-nonisolated struct BrushSettings: Codable, Hashable, Identifiable {
+nonisolated struct BrushSettings: Codable, Hashable, Identifiable, Sendable {
     var id = UUID()
     var name: String
     var kind: BrushKind
@@ -217,13 +217,13 @@ nonisolated struct BrushSettings: Codable, Hashable, Identifiable {
     }
 }
 
-nonisolated struct AnimatedStroke: Codable, Hashable, Identifiable {
+nonisolated struct AnimatedStroke: Codable, Hashable, Identifiable, Sendable {
     var id = UUID()
     var samples: [StrokeSample]
     var brush: BrushSettings
 }
 
-nonisolated struct CanvasFill: Codable, Hashable, Identifiable {
+nonisolated struct CanvasFill: Codable, Hashable, Identifiable, Sendable {
     var id = UUID()
     var samples: [StrokeSample]
     var color: CodableColor
@@ -232,7 +232,7 @@ nonisolated struct CanvasFill: Codable, Hashable, Identifiable {
     var animatedContours: [[StrokeSample]]? = nil
 }
 
-nonisolated struct DrawingLayer: Codable, Hashable, Identifiable {
+nonisolated struct DrawingLayer: Codable, Hashable, Identifiable, Sendable {
     var id = UUID()
     var name: String
     var isVisible = true
@@ -254,7 +254,7 @@ nonisolated struct DrawingLayer: Codable, Hashable, Identifiable {
     }
 }
 
-nonisolated struct WiggleDocument: Codable, Hashable, Identifiable {
+nonisolated struct WiggleDocument: Codable, Hashable, Identifiable, Sendable {
     var schemaVersion = 1
     var id = UUID()
     var name: String

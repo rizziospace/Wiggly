@@ -56,6 +56,12 @@ struct EditorView: View {
             }
 
             if showsLayers {
+                Color.black.opacity(0.001)
+                    .ignoresSafeArea()
+                    .contentShape(Rectangle())
+                    .onTapGesture { showsLayers = false }
+                    .zIndex(1)
+
                 HStack {
                     Spacer()
                     LayersSidebar(editor: editor, isPresented: $showsLayers)
@@ -78,6 +84,7 @@ struct EditorView: View {
         .coordinateSpace(name: "canvasSpace")
         .animation(.snappy(duration: 0.22), value: showsLayers)
         .animation(.easeInOut(duration: 0.2), value: showsBrushStudio)
+        .interactiveDismissDisabled(true)
         .statusBarHidden(true)
         .onAppear {
             editor.onAutosave = { [weak library] in library?.scheduleAutosave($0) }
@@ -194,6 +201,7 @@ struct EditorView: View {
                         .presentationCompactAdaptation(.popover)
                 }
                 .accessibilityLabel("Brush Color")
+                .accessibilityHint("Tap to edit colors. Touch and hold the canvas to sample a color.")
         }
         .padding(6)
         .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
@@ -285,6 +293,16 @@ struct EditorView: View {
                 .frame(width: 38)
                 .overlay(.white.opacity(0.18))
 
+            Button {
+                editor.isAnimationPlaying.toggle()
+            } label: {
+                Image(systemName: editor.isAnimationPlaying ? "pause.fill" : "play.fill")
+                    .frame(width: 28, height: 28)
+            }
+            .buttonStyle(RailButtonStyle())
+            .accessibilityLabel(editor.isAnimationPlaying ? "Pause animation" : "Play animation")
+            .accessibilityHint("Pause animation while drawing to improve performance on complex canvases")
+
             Button(action: editor.undo) {
                 Image(systemName: "arrow.uturn.backward")
                     .frame(width: 28, height: 28)
@@ -372,6 +390,12 @@ private struct DirectColorPicker: View {
     @State private var saturation: Double
     @State private var brightness: Double
     @State private var alpha: Double
+    @State private var activeControl: ColorControl?
+
+    private enum ColorControl {
+        case hue
+        case saturationBrightness
+    }
 
     private let swatches: [Color] = [
         .white, .black, .red, .orange, .yellow, .green, .cyan, .blue, .purple, .pink
@@ -471,12 +495,23 @@ private struct DirectColorPicker: View {
                 .gesture(
                     DragGesture(minimumDistance: 0)
                         .onChanged { value in
+                            if activeControl == nil {
+                                let distance = hypot(
+                                    value.startLocation.x - center.x,
+                                    value.startLocation.y - center.y
+                                )
+                                activeControl = distance > innerRadius
+                                    ? .hue
+                                    : .saturationBrightness
+                            }
                             updateSelection(
                                 location: value.location,
                                 center: center,
-                                innerRadius: innerRadius
+                                innerRadius: innerRadius,
+                                control: activeControl ?? .saturationBrightness
                             )
                         }
+                        .onEnded { _ in activeControl = nil }
                 )
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
@@ -530,11 +565,12 @@ private struct DirectColorPicker: View {
     private func updateSelection(
         location: CGPoint,
         center: CGPoint,
-        innerRadius: CGFloat
+        innerRadius: CGFloat,
+        control: ColorControl
     ) {
         let dx = location.x - center.x
         let dy = location.y - center.y
-        if hypot(dx, dy) > innerRadius {
+        if control == .hue {
             var newHue = atan2(dy, dx) / (Double.pi * 2)
             if newHue < 0 { newHue += 1 }
             hue = newHue

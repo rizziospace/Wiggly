@@ -11,11 +11,13 @@ final class EditorModel: ObservableObject {
     @Published var selectionMode = false
     @Published var eraserMode = false
     @Published var imageTransformMode = false
+    @Published var isAnimationPlaying = true
     @Published var selectedStrokeID: UUID?
 
     private var undoStack: [WiggleDocument] = []
     private var activeImageTransformGestures = 0
     private var isChangingLayerOpacity = false
+    private var isReorderingLayers = false
     private var redoStack: [WiggleDocument] = []
     var onAutosave: ((WiggleDocument) -> Void)?
 
@@ -58,6 +60,34 @@ final class EditorModel: ObservableObject {
     func endLayerOpacityChange() {
         guard isChangingLayerOpacity else { return }
         isChangingLayerOpacity = false
+        document.modifiedAt = Date()
+        onAutosave?(document)
+    }
+
+    func beginLayerReorder() {
+        guard !isReorderingLayers else { return }
+        checkpoint()
+        isReorderingLayers = true
+    }
+
+    func moveLayer(_ draggedID: UUID, relativeTo targetID: UUID, placeAfter: Bool) {
+        guard isReorderingLayers, draggedID != targetID else { return }
+        var displayed = Array(document.layers.reversed())
+        guard let sourceIndex = displayed.firstIndex(where: { $0.id == draggedID }) else { return }
+        let moved = displayed.remove(at: sourceIndex)
+        guard let targetIndex = displayed.firstIndex(where: { $0.id == targetID }) else { return }
+        displayed.insert(moved, at: targetIndex + (placeAfter ? 1 : 0))
+        let reorderedLayers = Array(displayed.reversed())
+        guard reorderedLayers.map(\.id) != document.layers.map(\.id) else { return }
+        var updated = document
+        updated.layers = reorderedLayers
+        updated.modifiedAt = Date()
+        document = updated
+    }
+
+    func endLayerReorder() {
+        guard isReorderingLayers else { return }
+        isReorderingLayers = false
         document.modifiedAt = Date()
         onAutosave?(document)
     }

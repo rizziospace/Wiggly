@@ -82,14 +82,54 @@ final class ProjectLibrary: ObservableObject {
 
     func scheduleAutosave(_ document: WiggleDocument) {
         pendingSaves[document.id]?.cancel()
+        let documentURL = documentURL(id: document.id)
+        let thumbnailURL = thumbnailURL(id: document.id)
+        let thumbnailSize = thumbnailRenderSize(for: document)
         pendingSaves[document.id] = Task { [weak self] in
             try? await Task.sleep(for: .milliseconds(450))
             guard !Task.isCancelled else { return }
-            self?.saveImmediately(document)
+
+            do {
+                let worker = Task.detached(priority: .utility) {
+                    try Task.checkCancellation()
+                    let encoder = JSONEncoder()
+                    encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+                    encoder.dateEncodingStrategy = .iso8601
+                    let data = try encoder.encode(document)
+                    try Task.checkCancellation()
+                    try data.write(to: documentURL, options: .atomic)
+
+                    try Task.checkCancellation()
+                    if let cgImage = AnimatedDrawingRenderer.image(
+                        document: document,
+                        phase: 0,
+                        outputSize: thumbnailSize
+                    ), let thumbnailData = UIImage(cgImage: cgImage).pngData() {
+                        try Task.checkCancellation()
+                        try thumbnailData.write(to: thumbnailURL, options: .atomic)
+                    }
+                }
+                try await withTaskCancellationHandler(
+                    operation: { try await worker.value },
+                    onCancel: { worker.cancel() }
+                )
+
+                guard !Task.isCancelled, let self else { return }
+                let item = self.summary(for: document)
+                self.projects.removeAll { $0.id == document.id }
+                self.projects.append(item)
+                self.projects.sort { $0.modifiedAt > $1.modifiedAt }
+                self.pendingSaves[document.id] = nil
+            } catch {
+                guard !Task.isCancelled else { return }
+                self?.lastError = "Couldn’t save this drawing: \(error.localizedDescription)"
+            }
         }
     }
 
     func saveImmediately(_ document: WiggleDocument) {
+        pendingSaves[document.id]?.cancel()
+        pendingSaves[document.id] = nil
         do {
             let data = try encoder.encode(document)
             try data.write(to: documentURL(id: document.id), options: .atomic)
@@ -149,11 +189,18 @@ final class ProjectLibrary: ObservableObject {
         )
     }
 
+    private func thumbnailRenderSize(for document: WiggleDocument) -> CGSize {
+        let width = CGFloat(max(1, document.width))
+        let height = CGFloat(max(1, document.height))
+        let scale = 512 / max(width, height)
+        return CGSize(width: max(1, width * scale), height: max(1, height * scale))
+    }
+
     private func writeThumbnail(for document: WiggleDocument) {
         guard let cgImage = AnimatedDrawingRenderer.image(
             document: document,
             phase: 0,
-            outputSize: CGSize(width: 512, height: 512)
+            outputSize: thumbnailRenderSize(for: document)
         ), let data = UIImage(cgImage: cgImage).pngData() else { return }
         try? data.write(to: thumbnailURL(id: document.id), options: .atomic)
     }

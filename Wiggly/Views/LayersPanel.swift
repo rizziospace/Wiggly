@@ -12,6 +12,11 @@ struct LayersSidebar: View {
     @State private var renamingLayerID: UUID?
     @State private var renameText = ""
     @State private var optionsLayerID: UUID?
+    @State private var draggedLayerID: UUID?
+    @State private var dragTranslation: CGSize = .zero
+    @State private var dropTargetLayerID: UUID?
+    @State private var dropTargetAfter = false
+    @State private var layerRowFrames: [UUID: CGRect] = [:]
 
     var body: some View {
         VStack(spacing: 0) {
@@ -20,33 +25,40 @@ struct LayersSidebar: View {
             opacityControl
             Divider().overlay(.white.opacity(0.12))
 
-            List {
-                ForEach(Array(editor.document.layers.reversed())) { layer in
-                    if let index = editor.document.layers.firstIndex(where: { $0.id == layer.id }) {
-                        layerRow(index: index)
-                            .listRowInsets(EdgeInsets(top: 4, leading: 10, bottom: 4, trailing: 10))
-                            .listRowBackground(Color.clear)
-                            .listRowSeparator(.hidden)
-                            .swipeActions(edge: .trailing, allowsFullSwipe: editor.document.layers.count > 1) {
-                                Button(role: .destructive) {
-                                    deleteSelected(index: index)
-                                } label: {
-                                    Label("Delete", systemImage: "trash")
+            ScrollView {
+                LazyVStack(spacing: 8) {
+                    ForEach(Array(editor.document.layers.reversed())) { layer in
+                        if let index = editor.document.layers.firstIndex(where: { $0.id == layer.id }) {
+                            layerRow(index: index)
+                                .background {
+                                    GeometryReader { proxy in
+                                        Color.clear.preference(
+                                            key: LayerRowFramePreferenceKey.self,
+                                            value: [layer.id: proxy.frame(in: .named("layerList"))]
+                                        )
+                                    }
                                 }
-                                .disabled(editor.document.layers.count <= 1)
-                            }
-                            .draggable(layer.id.uuidString)
-                            .dropDestination(for: String.self) { items, _ in
-                                guard let value = items.first,
-                                      let draggedID = UUID(uuidString: value) else { return false }
-                                moveLayer(draggedID, before: layer.id)
-                                return true
-                            }
+                                .overlay { layerDropIndicator(for: layer.id) }
+                                .offset(y: draggedLayerID == layer.id ? dragTranslation.height : 0)
+                                .scaleEffect(draggedLayerID == layer.id ? 1.04 : 1)
+                                .opacity(draggedLayerID == layer.id ? 0.94 : 1)
+                                .shadow(
+                                    color: draggedLayerID == layer.id ? .orange.opacity(0.38) : .clear,
+                                    radius: 12,
+                                    y: 6
+                                )
+                                .zIndex(draggedLayerID == layer.id ? 2 : 0)
+                                .animation(.spring(response: 0.24, dampingFraction: 0.72), value: draggedLayerID)
+                                .highPriorityGesture(layerReorderGesture(for: layer.id))
+                                .accessibilityHint("Touch and hold, then drag to reorder")
+                        }
                     }
                 }
+                .padding(.horizontal, 10)
+                .padding(.vertical, 8)
             }
-            .listStyle(.plain)
-            .scrollContentBackground(.hidden)
+            .coordinateSpace(name: "layerList")
+            .onPreferenceChange(LayerRowFramePreferenceKey.self) { layerRowFrames = $0 }
 
             Divider().overlay(.white.opacity(0.12))
             backgroundRow
@@ -145,40 +157,45 @@ struct LayersSidebar: View {
             }
             .buttonStyle(.plain)
 
-            Button {
+            HStack(spacing: 10) {
+                LayerMiniMap(
+                    layer: layer,
+                    canvasSize: CGSize(
+                        width: CGFloat(editor.document.width),
+                        height: CGFloat(editor.document.height)
+                    )
+                )
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(layer.name)
+                        .font(.subheadline.weight(selected ? .semibold : .regular))
+                        .foregroundStyle(.white)
+                        .lineLimit(1)
+                    Text(layer.imageData == nil
+                         ? "\(layer.strokes.count) stroke\(layer.strokes.count == 1 ? "" : "s")"
+                         : "Imported image")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+                if selected {
+                    Image(systemName: "checkmark.circle.fill").foregroundStyle(.orange)
+                }
+            }
+            .contentShape(Rectangle())
+            .onTapGesture {
                 if editor.document.selectedLayerID != layer.id {
                     editor.imageTransformMode = false
                 }
                 editor.document.selectedLayerID = layer.id
                 optionsLayerID = layer.id
-            } label: {
-                HStack(spacing: 10) {
-                    layerThumbnail(layer)
-                    VStack(alignment: .leading, spacing: 3) {
-                        Text(layer.name)
-                            .font(.subheadline.weight(selected ? .semibold : .regular))
-                            .foregroundStyle(.white)
-                            .lineLimit(1)
-                        Text(layer.imageData == nil
-                             ? "\(layer.strokes.count) stroke\(layer.strokes.count == 1 ? "" : "s")"
-                             : "Imported image")
-                            .font(.caption2)
-                            .foregroundStyle(.secondary)
-                    }
-                    Spacer()
-                    if selected {
-                        Image(systemName: "checkmark.circle.fill").foregroundStyle(.orange)
-                    }
-                }
-                .contentShape(Rectangle())
             }
-            .buttonStyle(.plain)
         }
         .padding(8)
         .background(
             selected ? Color.orange.opacity(0.14) : Color.black.opacity(0.13),
             in: RoundedRectangle(cornerRadius: 12, style: .continuous)
         )
+        .contentShape(Rectangle())
         .popover(isPresented: Binding(
             get: { optionsLayerID == layer.id },
             set: { if !$0 { optionsLayerID = nil } }
@@ -263,28 +280,6 @@ struct LayersSidebar: View {
                 .padding(.vertical, 8)
         }
         .buttonStyle(.plain)
-    }
-
-    @ViewBuilder
-    private func layerThumbnail(_ layer: DrawingLayer) -> some View {
-        ZStack {
-            RoundedRectangle(cornerRadius: 7).fill(.white)
-            if let data = layer.imageData, let image = UIImage(data: data) {
-                Image(uiImage: image)
-                    .resizable()
-                    .scaledToFill()
-                    .clipShape(RoundedRectangle(cornerRadius: 7))
-            } else if !layer.strokes.isEmpty {
-                Image(systemName: "scribble.variable")
-                    .foregroundStyle(.black.opacity(0.7))
-            }
-        }
-        .frame(width: 46, height: 46)
-        .clipped()
-        .overlay {
-            RoundedRectangle(cornerRadius: 7)
-                .stroke(.white.opacity(0.14), lineWidth: 1)
-        }
     }
 
     private var backgroundRow: some View {
@@ -375,7 +370,8 @@ struct LayersSidebar: View {
     private func addLayer() {
         editor.commit { document in
             let layer = DrawingLayer(name: "Layer \(document.layers.count + 1)")
-            document.layers.append(layer)
+            let insertionIndex = min(document.layers.count, document.selectedLayerIndex + 1)
+            document.layers.insert(layer, at: insertionIndex)
             document.selectedLayerID = layer.id
         }
     }
@@ -474,15 +470,192 @@ struct LayersSidebar: View {
         }
     }
 
-    private func moveLayer(_ draggedID: UUID, before targetID: UUID) {
-        guard draggedID != targetID else { return }
-        editor.commit { document in
-            var displayed = Array(document.layers.reversed())
-            guard let sourceIndex = displayed.firstIndex(where: { $0.id == draggedID }) else { return }
-            let movedLayer = displayed.remove(at: sourceIndex)
-            guard let targetIndex = displayed.firstIndex(where: { $0.id == targetID }) else { return }
-            displayed.insert(movedLayer, at: targetIndex)
-            document.layers = Array(displayed.reversed())
+    private func layerReorderGesture(for layerID: UUID) -> some Gesture {
+        LongPressGesture(minimumDuration: 0.22, maximumDistance: 12)
+            .sequenced(before: DragGesture(minimumDistance: 0, coordinateSpace: .named("layerList")))
+            .onChanged { value in
+                guard case .second(true, let drag?) = value else { return }
+                if draggedLayerID == nil {
+                    editor.beginLayerReorder()
+                    withAnimation(.spring(response: 0.24, dampingFraction: 0.7)) {
+                        draggedLayerID = layerID
+                    }
+                    UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+                }
+                dragTranslation = drag.translation
+                if abs(drag.translation.height) > 6 {
+                    updateDropTarget(for: layerID, at: drag.location.y)
+                }
+            }
+            .onEnded { _ in
+                guard draggedLayerID == layerID else { return }
+                withAnimation(.spring(response: 0.36, dampingFraction: 0.78)) {
+                    if let dropTargetLayerID {
+                        editor.moveLayer(
+                            layerID,
+                            relativeTo: dropTargetLayerID,
+                            placeAfter: dropTargetAfter
+                        )
+                    }
+                    editor.endLayerReorder()
+                    dragTranslation = .zero
+                    draggedLayerID = nil
+                    dropTargetLayerID = nil
+                    dropTargetAfter = false
+                }
+            }
+    }
+
+    private func updateDropTarget(for layerID: UUID, at verticalLocation: CGFloat) {
+        guard draggedLayerID == layerID,
+              let target = layerRowFrames
+                .filter({ $0.key != layerID })
+                .min(by: {
+                    abs($0.value.midY - verticalLocation) < abs($1.value.midY - verticalLocation)
+                }) else { return }
+        let placeAfter = verticalLocation > target.value.midY
+        guard dropTargetLayerID != target.key || dropTargetAfter != placeAfter else { return }
+        withAnimation(.easeOut(duration: 0.14)) {
+            dropTargetLayerID = target.key
+            dropTargetAfter = placeAfter
+        }
+        UISelectionFeedbackGenerator().selectionChanged()
+    }
+
+    @ViewBuilder
+    private func layerDropIndicator(for layerID: UUID) -> some View {
+        if dropTargetLayerID == layerID {
+            VStack(spacing: 0) {
+                if !dropTargetAfter {
+                    Capsule()
+                        .fill(.orange)
+                        .frame(height: 3)
+                        .shadow(color: .orange.opacity(0.65), radius: 4)
+                        .offset(y: -5)
+                }
+                Spacer(minLength: 0)
+                if dropTargetAfter {
+                    Capsule()
+                        .fill(.orange)
+                        .frame(height: 3)
+                        .shadow(color: .orange.opacity(0.65), radius: 4)
+                        .offset(y: 5)
+                }
+            }
+            .padding(.horizontal, 4)
+            .allowsHitTesting(false)
+            .transition(.opacity.combined(with: .scale(scale: 0.92)))
+        }
+    }
+}
+
+private struct LayerRowFramePreferenceKey: PreferenceKey {
+    static var defaultValue: [UUID: CGRect] = [:]
+
+    static func reduce(value: inout [UUID: CGRect], nextValue: () -> [UUID: CGRect]) {
+        value.merge(nextValue(), uniquingKeysWith: { _, new in new })
+    }
+}
+
+private struct LayerMiniMap: View {
+    let layer: DrawingLayer
+    let canvasSize: CGSize
+
+    var body: some View {
+        Canvas(rendersAsynchronously: true) { context, size in
+            drawCheckerboard(in: &context, size: size)
+            guard canvasSize.width > 0, canvasSize.height > 0 else { return }
+
+            let scale = min(size.width / canvasSize.width, size.height / canvasSize.height)
+            let drawingSize = CGSize(
+                width: canvasSize.width * scale,
+                height: canvasSize.height * scale
+            )
+            let origin = CGPoint(
+                x: (size.width - drawingSize.width) / 2,
+                y: (size.height - drawingSize.height) / 2
+            )
+
+            context.clip(to: Path(CGRect(origin: origin, size: drawingSize)))
+            context.opacity = layer.opacity
+
+            if let data = layer.imageData, let image = UIImage(data: data) {
+                let fittedScale = min(
+                    canvasSize.width / max(1, image.size.width),
+                    canvasSize.height / max(1, image.size.height)
+                ) * layer.resolvedImageScale
+                let imageSize = CGSize(
+                    width: image.size.width * fittedScale * scale,
+                    height: image.size.height * fittedScale * scale
+                )
+                let offset = layer.resolvedImageOffset
+                let imageRect = CGRect(
+                    x: origin.x + (drawingSize.width - imageSize.width) / 2 + offset.x * scale,
+                    y: origin.y + (drawingSize.height - imageSize.height) / 2 + offset.y * scale,
+                    width: imageSize.width,
+                    height: imageSize.height
+                )
+                context.draw(Image(uiImage: image), in: imageRect)
+            }
+
+            for fill in layer.fills ?? [] where fill.samples.count > 2 {
+                var path = Path()
+                let first = miniPoint(fill.samples[0].point, origin: origin, scale: scale)
+                path.move(to: first)
+                for sample in fill.samples.dropFirst() {
+                    path.addLine(to: miniPoint(sample.point, origin: origin, scale: scale))
+                }
+                path.closeSubpath()
+                context.fill(path, with: .color(fill.color.swiftUIColor))
+            }
+
+            for stroke in layer.strokes where stroke.samples.count > 1 {
+                var path = Path()
+                path.move(to: miniPoint(stroke.samples[0].point, origin: origin, scale: scale))
+                for sample in stroke.samples.dropFirst() {
+                    path.addLine(to: miniPoint(sample.point, origin: origin, scale: scale))
+                }
+                context.stroke(
+                    path,
+                    with: .color(stroke.brush.color.swiftUIColor.opacity(stroke.brush.opacity)),
+                    style: StrokeStyle(
+                        lineWidth: max(0.7, stroke.brush.size * scale),
+                        lineCap: .round,
+                        lineJoin: .round
+                    )
+                )
+            }
+        }
+        .frame(width: 46, height: 46)
+        .background(.white)
+        .clipShape(RoundedRectangle(cornerRadius: 7, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 7, style: .continuous)
+                .stroke(.white.opacity(0.18), lineWidth: 1)
+        }
+    }
+
+    private func miniPoint(_ point: CGPoint, origin: CGPoint, scale: CGFloat) -> CGPoint {
+        CGPoint(x: origin.x + point.x * scale, y: origin.y + point.y * scale)
+    }
+
+    private func drawCheckerboard(in context: inout GraphicsContext, size: CGSize) {
+        let tile: CGFloat = 6
+        let rows = Int(ceil(size.height / tile))
+        let columns = Int(ceil(size.width / tile))
+        for row in 0..<rows {
+            for column in 0..<columns {
+                let shade = (row + column).isMultiple(of: 2) ? 0.94 : 0.82
+                context.fill(
+                    Path(CGRect(
+                        x: CGFloat(column) * tile,
+                        y: CGFloat(row) * tile,
+                        width: tile,
+                        height: tile
+                    )),
+                    with: .color(Color(white: shade))
+                )
+            }
         }
     }
 }
