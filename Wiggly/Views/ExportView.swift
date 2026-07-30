@@ -40,6 +40,8 @@ struct ExportView: View {
                         Picker("Codec", selection: $settings.codec) {
                             ForEach(VideoCodec.allCases) { Text($0.title).tag($0) }
                         }
+                    }
+                    if settings.format.isVideo {
                         LabeledContent("Bitrate") {
                             HStack {
                                 Slider(value: $settings.bitrateMbps, in: 1...50)
@@ -47,6 +49,11 @@ struct ExportView: View {
                                     .frame(width: 72)
                             }
                         }
+                    }
+                    if settings.format == .movAlpha {
+                        Label("HEVC with alpha preserves transparent pixels in a .mov file.", systemImage: "checkerboard.rectangle")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
                     }
                 }
 
@@ -72,8 +79,19 @@ struct ExportView: View {
                     }
                 }
 
-                if settings.format != .mp4 {
-                    Section("Background") {
+                Section("Background") {
+                    if settings.format == .mp4 {
+                        Label("MP4/H.264 and standard HEVC do not support transparency. The canvas background will be included.", systemImage: "info.circle")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    } else if settings.format == .movAlpha {
+                        Label("Transparent background is enabled for this format.", systemImage: "checkerboard.rectangle")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                        Label("iOS Photos may preview this video as opaque or duplicated. The exported file keeps its transparency; preview it in Files or on a Mac.", systemImage: "info.circle")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    } else {
                         Toggle("Transparent background", isOn: $settings.transparentBackground)
                         if !document.resolvedBackgroundVisible {
                             Label("The Background Color layer is hidden, so this export will be transparent.", systemImage: "checkerboard.rectangle")
@@ -179,7 +197,7 @@ struct ExportView: View {
     private func photosSaveTitle(for format: ExportFormat) -> String? {
         switch format {
         case .png, .gif: "Save Image"
-        case .mp4: "Save Video"
+        case .mp4, .movAlpha: "Save Video"
         case .pngSequence: nil
         }
     }
@@ -191,7 +209,7 @@ struct ExportView: View {
                 try await PhotoLibraryExporter.save(file)
                 alertTitle = "Saved to Photos"
                 showsSettingsAction = false
-                errorMessage = file.format == .mp4
+                errorMessage = file.format.isVideo
                     ? "The video was saved to your Photos library."
                     : "The image was saved to your Photos library."
             } catch PhotoLibrarySaveError.permissionDenied {
@@ -255,7 +273,7 @@ private enum PhotoLibraryExporter {
         switch file.format {
         case .png, .gif:
             resourceType = .photo
-        case .mp4:
+        case .mp4, .movAlpha:
             resourceType = .video
         case .pngSequence:
             throw PhotoLibrarySaveError.unsupportedFormat

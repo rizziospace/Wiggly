@@ -10,6 +10,7 @@ enum ExportFormat: String, CaseIterable, Identifiable, Sendable {
     case png
     case gif
     case mp4
+    case movAlpha
     case pngSequence
 
     var id: String { rawValue }
@@ -17,9 +18,14 @@ enum ExportFormat: String, CaseIterable, Identifiable, Sendable {
         switch self {
         case .png: "Static PNG"
         case .gif: "Animated GIF"
-        case .mp4: "MP4 Video"
+        case .mp4: "MP4 Video (Opaque)"
+        case .movAlpha: "Transparent MOV (HEVC Alpha)"
         case .pngSequence: "PNG Sequence ZIP"
         }
+    }
+
+    var isVideo: Bool {
+        self == .mp4 || self == .movAlpha
     }
 }
 
@@ -78,7 +84,7 @@ enum ExportService {
         guard (256...4096).contains(settings.width), (256...4096).contains(settings.height) else {
             throw ExportError.invalidDimensions
         }
-        if settings.format == .mp4 && (settings.width.isMultiple(of: 2) == false || settings.height.isMultiple(of: 2) == false) {
+        if settings.format.isVideo && (settings.width.isMultiple(of: 2) == false || settings.height.isMultiple(of: 2) == false) {
             throw ExportError.invalidDimensions
         }
 
@@ -87,7 +93,7 @@ enum ExportService {
             return try exportPNG(document: document, settings: settings)
         case .gif:
             return try await exportGIF(document: document, settings: settings, progress: progress)
-        case .mp4:
+        case .mp4, .movAlpha:
             return try await exportVideo(document: document, settings: settings, progress: progress)
         case .pngSequence:
             return try await exportPNGSequence(document: document, settings: settings, progress: progress)
@@ -106,11 +112,13 @@ enum ExportService {
         if settings.format == .mp4 {
             renderDocument.backgroundVisible = true
         }
+        let exportsAlpha = settings.format == .movAlpha
+            || (settings.transparentBackground && settings.format != .mp4)
         guard let image = AnimatedDrawingRenderer.image(
             document: renderDocument,
             phase: phase,
             outputSize: CGSize(width: settings.width, height: settings.height),
-            transparent: settings.transparentBackground && settings.format != .mp4
+            transparent: exportsAlpha
         ) else {
             throw ExportError.destinationCreation
         }
@@ -189,10 +197,17 @@ enum ExportService {
         settings: ExportSettings,
         progress: @escaping (Double) -> Void
     ) async throws -> URL {
-        let url = temporaryURL(name: settings.sanitizedFilename, extension: "mp4")
-        let writer = try AVAssetWriter(outputURL: url, fileType: .mp4)
+        let exportsAlpha = settings.format == .movAlpha
+        let url = temporaryURL(
+            name: settings.sanitizedFilename,
+            extension: exportsAlpha ? "mov" : "mp4"
+        )
+        let writer = try AVAssetWriter(
+            outputURL: url,
+            fileType: exportsAlpha ? .mov : .mp4
+        )
         let outputSettings: [String: Any] = [
-            AVVideoCodecKey: settings.codec.avCodec,
+            AVVideoCodecKey: exportsAlpha ? AVVideoCodecType.hevcWithAlpha : settings.codec.avCodec,
             AVVideoWidthKey: settings.width,
             AVVideoHeightKey: settings.height,
             AVVideoCompressionPropertiesKey: [
@@ -226,7 +241,12 @@ enum ExportService {
             var optionalBuffer: CVPixelBuffer?
             CVPixelBufferPoolCreatePixelBuffer(nil, pool, &optionalBuffer)
             guard let buffer = optionalBuffer else { throw ExportError.destinationCreation }
-            try draw(try image(document: document, settings: settings, frame: frame), into: buffer, document: document)
+            try draw(
+                try image(document: document, settings: settings, frame: frame),
+                into: buffer,
+                document: document,
+                preservesAlpha: exportsAlpha
+            )
             let time = CMTime(value: CMTimeValue(frame), timescale: CMTimeScale(settings.framesPerSecond))
             guard adaptor.append(buffer, withPresentationTime: time) else {
                 throw ExportError.writerFailure(writer.error?.localizedDescription ?? "Couldn’t append a frame.")
@@ -245,7 +265,12 @@ enum ExportService {
         return url
     }
 
-    private static func draw(_ image: CGImage, into pixelBuffer: CVPixelBuffer, document: WiggleDocument) throws {
+    private static func draw(
+        _ image: CGImage,
+        into pixelBuffer: CVPixelBuffer,
+        document: WiggleDocument,
+        preservesAlpha: Bool
+    ) throws {
         CVPixelBufferLockBaseAddress(pixelBuffer, [])
         defer { CVPixelBufferUnlockBaseAddress(pixelBuffer, []) }
         guard let base = CVPixelBufferGetBaseAddress(pixelBuffer) else { throw ExportError.destinationCreation }
@@ -260,13 +285,17 @@ enum ExportService {
             space: CGColorSpace(name: CGColorSpace.sRGB)!,
             bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue | CGBitmapInfo.byteOrder32Little.rawValue
         ) else { throw ExportError.destinationCreation }
-        context.setFillColor(UIColor(
-            red: document.background.red,
-            green: document.background.green,
-            blue: document.background.blue,
-            alpha: 1
-        ).cgColor)
-        context.fill(CGRect(x: 0, y: 0, width: width, height: height))
-        context.draw(image, in: CGRect(x: 0, y: 0, width: width, height: height))
+        let bounds = CGRect(x: 0, y: 0, width: width, height: height)
+        context.clear(bounds)
+        if !preservesAlpha {
+            context.setFillColor(UIColor(
+                red: document.background.red,
+                green: document.background.green,
+                blue: document.background.blue,
+                alpha: 1
+            ).cgColor)
+            context.fill(bounds)
+        }
+        context.draw(image, in: bounds)
     }
 }
