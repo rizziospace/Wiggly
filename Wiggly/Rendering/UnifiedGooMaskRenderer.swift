@@ -41,14 +41,24 @@ final class UnifiedGooMaskRenderer {
         var strokes: [SourceStroke]
     }
 
-    /// Layout must match GooSegment in Metal (32 bytes).
+    /// Layout must match GooSegment in Metal.
     private struct GooSegment {
         var a: SIMD2<Float>
         var b: SIMD2<Float>
+        var normalA: SIMD2<Float>
+        var normalB: SIMD2<Float>
         var radiusA: Float
         var radiusB: Float
         var arcA: Float
         var arcB: Float
+        var totalLength: Float
+        var seed: Float
+        var speed: Float
+        var waviness: Float
+        var waveLength: Float
+        var padding0: Float = 0
+        var padding1: Float = 0
+        var padding2: Float = 0
     }
 
     private struct MaskParams {
@@ -56,6 +66,7 @@ final class UnifiedGooMaskRenderer {
         var width: UInt32
         var height: UInt32
         var antialiasPixels: Float
+        var phase: Float
     }
 
     private struct PreparedBatch {
@@ -176,7 +187,8 @@ final class UnifiedGooMaskRenderer {
                 commandBuffer: commandBuffer,
                 mask: batch.mask,
                 segmentBuffer: batch.segments,
-                segmentCount: batch.segmentCount
+                segmentCount: batch.segmentCount,
+                phase: transform.phase
             )
         }
     }
@@ -208,7 +220,13 @@ final class UnifiedGooMaskRenderer {
                 options: .storageModeShared
               ) else { return }
         let mask = ensurePreviewMask(width: target.width, height: target.height)
-        encodeMask(commandBuffer: commandBuffer, mask: mask, segmentBuffer: buffer, segmentCount: segments.count)
+        encodeMask(
+            commandBuffer: commandBuffer,
+            mask: mask,
+            segmentBuffer: buffer,
+            segmentCount: segments.count,
+            phase: transform.phase
+        )
 
         let pass = MTLRenderPassDescriptor()
         pass.colorAttachments[0].texture = target
@@ -280,7 +298,31 @@ final class UnifiedGooMaskRenderer {
         if vertices.count == 1 {
             let center = toPixel(vertices[0].point)
             let radius = vertices[0].radius * documentToPixel
-            return [GooSegment(a: center, b: center, radiusA: radius, radiusB: radius, arcA: 0, arcB: 0)]
+            return [GooSegment(
+                a: center,
+                b: center,
+                normalA: SIMD2(0, 1),
+                normalB: SIMD2(0, 1),
+                radiusA: radius,
+                radiusB: radius,
+                arcA: 0,
+                arcB: 0,
+                totalLength: 0,
+                seed: stableSeed(source.stroke),
+                speed: Float(source.stroke.brush.resolvedGooSpeed),
+                waviness: Float(source.stroke.brush.resolvedGooWaviness),
+                waveLength: Float(source.stroke.brush.resolvedGooWaveLength)
+            )]
+        }
+        let totalLength = vertices.last!.arcLength * documentToPixel
+        let strokeSeed = stableSeed(source.stroke)
+        let rotationCos = cos(transform.rotation)
+        let rotationSin = sin(transform.rotation)
+        func rotatedNormal(_ normal: SIMD2<Float>) -> SIMD2<Float> {
+            SIMD2(
+                normal.x * rotationCos - normal.y * rotationSin,
+                normal.x * rotationSin + normal.y * rotationCos
+            )
         }
         var result: [GooSegment] = []
         result.reserveCapacity(vertices.count - 1)
@@ -290,13 +332,28 @@ final class UnifiedGooMaskRenderer {
             result.append(GooSegment(
                 a: toPixel(a.point),
                 b: toPixel(b.point),
+                normalA: rotatedNormal(a.normal),
+                normalB: rotatedNormal(b.normal),
                 radiusA: a.radius * documentToPixel,
                 radiusB: b.radius * documentToPixel,
                 arcA: a.arcLength * documentToPixel,
-                arcB: b.arcLength * documentToPixel
+                arcB: b.arcLength * documentToPixel,
+                totalLength: totalLength,
+                seed: strokeSeed,
+                speed: Float(source.stroke.brush.resolvedGooSpeed),
+                waviness: Float(source.stroke.brush.resolvedGooWaviness),
+                waveLength: Float(source.stroke.brush.resolvedGooWaveLength)
             ))
         }
         return result
+    }
+
+    private func stableSeed(_ stroke: AnimatedStroke) -> Float {
+        var hash = stroke.brush.seed ^ 0xcbf29ce484222325
+        for byte in stroke.id.uuidString.utf8 {
+            hash = (hash ^ UInt64(byte)) &* 0x100000001b3
+        }
+        return Float(hash & 0x00ff_ffff) / Float(0x0100_0000)
     }
 
     /// Centripetal Catmull-Rom sampling with recursive screen-space flatness and
@@ -464,7 +521,8 @@ final class UnifiedGooMaskRenderer {
         commandBuffer: MTLCommandBuffer,
         mask: MTLTexture,
         segmentBuffer: MTLBuffer,
-        segmentCount: Int
+        segmentCount: Int,
+        phase: Float
     ) {
         let threadsPerGroup = MTLSize(width: 8, height: 8, depth: 1)
         let threads = MTLSize(width: mask.width, height: mask.height, depth: 1)
@@ -479,7 +537,8 @@ final class UnifiedGooMaskRenderer {
             segmentCount: UInt32(segmentCount),
             width: UInt32(mask.width),
             height: UInt32(mask.height),
-            antialiasPixels: 1.25
+            antialiasPixels: 1.25,
+            phase: phase
         )
         guard let encoder = commandBuffer.makeComputeCommandEncoder() else { return }
         encoder.label = "Unified Goo Baseline SDF"
@@ -528,10 +587,20 @@ final class UnifiedGooMaskRenderer {
     struct GooSegment {
         float2 a;
         float2 b;
+        float2 normalA;
+        float2 normalB;
         float radiusA;
         float radiusB;
         float arcA;
         float arcB;
+        float totalLength;
+        float seed;
+        float speed;
+        float waviness;
+        float waveLength;
+        float padding0;
+        float padding1;
+        float padding2;
     };
 
     struct MaskParams {
@@ -539,6 +608,7 @@ final class UnifiedGooMaskRenderer {
         uint width;
         uint height;
         float antialiasPixels;
+        float phase;
     };
 
     kernel void unifiedGooClearMask(
@@ -548,14 +618,40 @@ final class UnifiedGooMaskRenderer {
         mask.write(half4(0.0h), gid);
     }
 
-    inline float variableCapsuleDistance(float2 p, device const GooSegment &segment) {
+    inline float wrappedArcDistance(float a, float b, float length) {
+        float d = abs(a - b);
+        return min(d, max(0.0, length - d));
+    }
+
+    inline float bodyPulse(float arc, device const GooSegment &segment, float phase) {
+        if (segment.totalLength < 1.0 || segment.waviness < 0.001) { return 0.0; }
+        float wavelength = mix(0.36, 0.16, segment.waveLength) * segment.totalLength;
+        wavelength = max(wavelength, max(segment.radiusA, segment.radiusB) * 3.5);
+        float travel = phase * segment.totalLength * mix(0.35, 1.6, clamp(segment.speed * 0.5, 0.0, 1.0));
+        float pulse = 0.0;
+        for (uint index = 0; index < 3; ++index) {
+            float offset = fract(segment.seed * (7.31 + float(index) * 3.17) + float(index) * 0.331);
+            float direction = index == 1 ? -0.72 : 1.0;
+            float center = fmod(offset * segment.totalLength + travel * direction + segment.totalLength * 4.0, segment.totalLength);
+            float x = wrappedArcDistance(arc, center, segment.totalLength) / wavelength;
+            float envelope = exp(-x * x * 18.0);
+            pulse += envelope * (1.0 - float(index) * 0.16);
+        }
+        return min(1.35, pulse) * segment.waviness;
+    }
+
+    inline float variableCapsuleDistance(float2 p, device const GooSegment &segment, float phase) {
         float2 axis = segment.b - segment.a;
         float axisLengthSquared = dot(axis, axis);
         float t = axisLengthSquared > 1e-8
             ? clamp(dot(p - segment.a, axis) / axisLengthSquared, 0.0, 1.0)
             : 0.0;
-        float2 center = mix(segment.a, segment.b, t);
-        float radius = mix(segment.radiusA, segment.radiusB, t);
+        float arc = mix(segment.arcA, segment.arcB, t);
+        float pulse = bodyPulse(arc, segment, phase);
+        float radius = mix(segment.radiusA, segment.radiusB, t) * (1.0 + pulse * 0.34);
+        float2 normal = normalize(mix(segment.normalA, segment.normalB, t));
+        float leanSign = fract(segment.seed * 19.19) < 0.5 ? -1.0 : 1.0;
+        float2 center = mix(segment.a, segment.b, t) + normal * leanSign * radius * pulse * 0.10;
         return length(p - center) - radius;
     }
 
@@ -568,7 +664,7 @@ final class UnifiedGooMaskRenderer {
         float2 p = float2(gid) + 0.5;
         float distance = INFINITY;
         for (uint index = 0; index < params.segmentCount; ++index) {
-            distance = min(distance, variableCapsuleDistance(p, segments[index]));
+            distance = min(distance, variableCapsuleDistance(p, segments[index], params.phase));
         }
         float coverage = 0.0;
         if (distance < params.antialiasPixels) {
