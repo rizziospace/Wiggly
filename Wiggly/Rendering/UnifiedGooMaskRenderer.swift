@@ -180,6 +180,91 @@ final class UnifiedGooMaskRenderer {
         preparedSignature = nil
     }
 
+    /// Export entry point used by PNG, GIF, and video frames. It executes the
+    /// same spline data model, mask kernel, event timing, and composite shader as
+    /// the live canvas.
+    static func exportImage(
+        document: WiggleDocument,
+        size: CGSize,
+        phase: Double
+    ) -> CGImage? {
+        let width = Int(size.width.rounded())
+        let height = Int(size.height.rounded())
+        guard width > 0, height > 0,
+              let device = MTLCreateSystemDefaultDevice(),
+              let queue = device.makeCommandQueue(),
+              let renderer = UnifiedGooMaskRenderer(device: device, pixelFormat: .bgra8Unorm) else {
+            return nil
+        }
+        let descriptor = MTLTextureDescriptor.texture2DDescriptor(
+            pixelFormat: .bgra8Unorm,
+            width: width,
+            height: height,
+            mipmapped: false
+        )
+        descriptor.usage = [.renderTarget, .shaderRead]
+        descriptor.storageMode = .shared
+        guard let target = device.makeTexture(descriptor: descriptor),
+              let commandBuffer = queue.makeCommandBuffer() else { return nil }
+
+        renderer.update(document: document)
+        let transform = ViewTransform(
+            canvasSize: SIMD2(Float(document.width), Float(document.height)),
+            viewSize: SIMD2(Float(width), Float(height)),
+            fittedSize: SIMD2(Float(width), Float(height)),
+            centerOffset: .zero,
+            zoom: 1,
+            rotation: 0,
+            phase: Float(phase)
+        )
+        renderer.precompute(
+            commandBuffer: commandBuffer,
+            drawableSize: SIMD2(width, height),
+            transform: transform
+        )
+
+        let pass = MTLRenderPassDescriptor()
+        pass.colorAttachments[0].texture = target
+        pass.colorAttachments[0].loadAction = .clear
+        pass.colorAttachments[0].storeAction = .store
+        pass.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 0)
+        guard let encoder = commandBuffer.makeRenderCommandEncoder(descriptor: pass) else { return nil }
+        for layer in document.layers where document.isLayerEffectivelyVisible(layer) {
+            renderer.encode(encoder: encoder, layerID: layer.id)
+        }
+        encoder.endEncoding()
+        commandBuffer.commit()
+        commandBuffer.waitUntilCompleted()
+        guard commandBuffer.status == .completed else { return nil }
+
+        let bytesPerRow = width * 4
+        var bytes = [UInt8](repeating: 0, count: bytesPerRow * height)
+        target.getBytes(
+            &bytes,
+            bytesPerRow: bytesPerRow,
+            from: MTLRegionMake2D(0, 0, width, height),
+            mipmapLevel: 0
+        )
+        guard let provider = CGDataProvider(data: Data(bytes) as CFData),
+              let colorSpace = CGColorSpace(name: CGColorSpace.sRGB) else { return nil }
+        let bitmapInfo = CGBitmapInfo.byteOrder32Little.union(
+            CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedFirst.rawValue)
+        )
+        return CGImage(
+            width: width,
+            height: height,
+            bitsPerComponent: 8,
+            bitsPerPixel: 32,
+            bytesPerRow: bytesPerRow,
+            space: colorSpace,
+            bitmapInfo: bitmapInfo,
+            provider: provider,
+            decode: nil,
+            shouldInterpolate: true,
+            intent: .defaultIntent
+        )
+    }
+
     func precompute(
         commandBuffer: MTLCommandBuffer,
         drawableSize: SIMD2<Int>,
@@ -750,6 +835,21 @@ final class UnifiedGooMaskRenderer {
         return length(p - mix(a, b, t)) - mix(radiusA, radiusB, t);
     }
 
+    inline float curvedNeckDistance(
+        float2 p,
+        float2 a,
+        float2 b,
+        float2 bendDirection,
+        float bend,
+        float radiusA,
+        float radiusB) {
+        float2 midpoint = mix(a, b, 0.5) + bendDirection * bend;
+        float middleRadius = mix(radiusA, radiusB, 0.5) * 0.82;
+        float first = neckDistance(p, a, midpoint, radiusA, middleRadius);
+        float second = neckDistance(p, midpoint, b, middleRadius, radiusB);
+        return gooSmoothMinimum(first, second, max(0.35, middleRadius * 0.24));
+    }
+
     struct StrokeFrame {
         float2 position;
         float2 normal;
@@ -785,28 +885,42 @@ final class UnifiedGooMaskRenderer {
         return frame;
     }
 
-    inline float singleDropletEventDistance(
+    inline float random21(float2 value) {
+        return fract(sin(dot(value, float2(127.1, 311.7))) * 43758.5453123);
+    }
+
+    inline float dropletEventDistance(
         float2 p,
         device const GooSegment *segments,
         device const GooStrokeInfo &stroke,
         float phase,
-        thread bool &attached) {
+        uint eventIndex,
+        thread bool &attached,
+        thread float &attachmentBlend) {
         attached = false;
+        attachmentBlend = 0.0;
         if (stroke.droplets < 0.01 || stroke.totalLength < 8.0) { return INFINITY; }
-        float sourceFraction = mix(0.16, 0.48, fract(stroke.seed * 13.73));
-        float destinationFraction = fract(sourceFraction + mix(0.34, 0.62, fract(stroke.seed * 29.17)));
+        float eventSeed = random21(float2(stroke.seed * 91.7, float(eventIndex) + 0.37));
+        float sourceFraction = mix(0.10, 0.78, random21(float2(eventSeed, 1.17)));
+        float destinationFraction = fract(sourceFraction
+            + mix(0.28, 0.68, random21(float2(eventSeed, 2.31))));
         float sourceArc = sourceFraction * stroke.totalLength;
         float destinationArc = destinationFraction * stroke.totalLength;
         StrokeFrame source = strokeFrameAtArc(segments, stroke, sourceArc, phase);
+        // Tiny droplets collapse into unstable subpixel specks. Preserve the
+        // artifact-free thin-stroke baseline until there is room for a clean neck.
+        if (source.radius < 12.0) { return INFINITY; }
         StrokeFrame destination = strokeFrameAtArc(segments, stroke, destinationArc, phase);
-        float side = fract(stroke.seed * 41.91) < 0.5 ? -1.0 : 1.0;
+        float side = random21(float2(eventSeed, 3.73)) < 0.5 ? -1.0 : 1.0;
         float eventTime = fract(phase * mix(0.55, 1.25, clamp(stroke.speed * 0.5, 0.0, 1.0))
-            + stroke.seed * 5.37);
-        float dropletRadius = source.radius * mix(0.30, 0.48, fract(stroke.seed * 71.11));
+            + eventSeed * 3.71 + float(eventIndex) * 0.217);
+        float dropletRadius = source.radius * mix(0.27, 0.50, random21(float2(eventSeed, 4.97)));
         float2 start = source.position + source.normal * side * source.radius * 0.70;
-        float2 detached = source.position + source.normal * side * source.radius * 3.3;
-        float destinationSide = -side;
-        float2 arrival = destination.position + destination.normal * destinationSide * destination.radius * 3.0;
+        float outwardScale = mix(2.7, 4.2, random21(float2(eventSeed, 5.53)));
+        float2 detached = source.position + source.normal * side * source.radius * outwardScale;
+        float destinationSide = random21(float2(eventSeed, 6.11)) < 0.35 ? side : -side;
+        float2 arrival = destination.position + destination.normal * destinationSide
+            * destination.radius * mix(2.5, 3.8, random21(float2(eventSeed, 7.19)));
         float2 end = destination.position + destination.normal * destinationSide * destination.radius * 0.72;
         float2 center;
         float radius = dropletRadius;
@@ -817,6 +931,7 @@ final class UnifiedGooMaskRenderer {
             center = mix(start, source.position + source.normal * side * source.radius * 1.35, u);
             radius *= u;
             attached = true;
+            attachmentBlend = max(0.75, source.radius * 0.34);
             float circle = circleDistance(p, center, radius);
             float neck = neckDistance(p, source.position, center, source.radius * 0.42, max(0.1, radius * 0.74));
             distance = gooSmoothMinimum(circle, neck, max(0.5, radius * 0.34));
@@ -824,23 +939,44 @@ final class UnifiedGooMaskRenderer {
             float u = smoothstep(0.20, 0.42, eventTime);
             center = mix(source.position + source.normal * side * source.radius * 1.35, detached, u);
             attached = true;
+            attachmentBlend = max(0.5, source.radius * mix(0.32, 0.08, u));
             float circle = circleDistance(p, center, radius);
-            float neckRadius = radius * mix(0.68, 0.035, u);
-            float neck = neckDistance(p, source.position, center, source.radius * 0.34, neckRadius);
-            distance = gooSmoothMinimum(circle, neck, max(0.25, radius * mix(0.30, 0.03, u)));
+            float neckRadius = radius * mix(0.68, 0.14, u);
+            float2 sourceTangent = float2(-source.normal.y, source.normal.x) * side;
+            float neck = curvedNeckDistance(
+                p,
+                source.position,
+                center,
+                sourceTangent,
+                sin(u * M_PI_F) * source.radius * 0.46,
+                source.radius * 0.34,
+                neckRadius
+            );
+            distance = gooSmoothMinimum(circle, neck, max(0.5, radius * mix(0.30, 0.08, u)));
         } else if (eventTime < 0.84) {
             float u = smoothstep(0.42, 0.84, eventTime);
             float2 linear = mix(detached, arrival, u);
-            float2 travelNormal = normalize(source.normal + destination.normal * 0.35);
-            center = linear + travelNormal * side * sin(u * M_PI_F) * source.radius * 2.2;
+            float2 travelNormal = normalize(source.normal + destination.normal * 0.35 + float2(0.001));
+            float travelArc = mix(1.4, 2.8, random21(float2(eventSeed, 8.41)));
+            center = linear + travelNormal * side * sin(u * M_PI_F) * source.radius * travelArc;
             distance = circleDistance(p, center, radius);
         } else {
             float u = smoothstep(0.84, 1.0, eventTime);
             center = mix(arrival, end, u);
             radius *= 1.0 - u * 0.52;
             attached = true;
+            attachmentBlend = max(0.75, destination.radius * 0.34);
             float circle = circleDistance(p, center, radius);
-            float neck = neckDistance(p, destination.position, center, destination.radius * 0.38, radius * mix(0.08, 0.72, u));
+            float2 destinationTangent = float2(-destination.normal.y, destination.normal.x) * destinationSide;
+            float neck = curvedNeckDistance(
+                p,
+                destination.position,
+                center,
+                destinationTangent,
+                sin(u * M_PI_F) * destination.radius * 0.38,
+                destination.radius * 0.38,
+                radius * mix(0.12, 0.72, u)
+            );
             distance = gooSmoothMinimum(circle, neck, max(0.25, radius * 0.30));
         }
         return distance;
@@ -858,25 +994,26 @@ final class UnifiedGooMaskRenderer {
         for (uint index = 0; index < params.segmentCount; ++index) {
             distance = min(distance, variableCapsuleDistance(p, segments[index], params.phase));
         }
-        for (uint index = 0; index < params.strokeCount; ++index) {
-            bool attached = false;
-            float eventDistance = singleDropletEventDistance(
-                p,
-                segments,
-                strokes[index],
-                params.phase,
-                attached
-            );
-            if (attached) {
-                float blend = max(0.5, strokeFrameAtArc(
+        for (uint strokeIndex = 0; strokeIndex < params.strokeCount; ++strokeIndex) {
+            uint eventCount = 1u + uint(round(clamp(strokes[strokeIndex].droplets, 0.0, 1.0) * 2.0));
+            eventCount = min(3u, eventCount);
+            for (uint eventIndex = 0; eventIndex < eventCount; ++eventIndex) {
+                bool attached = false;
+                float attachmentBlend = 0.0;
+                float eventDistance = dropletEventDistance(
+                    p,
                     segments,
-                    strokes[index],
-                    strokes[index].totalLength * mix(0.16, 0.48, fract(strokes[index].seed * 13.73)),
-                    params.phase
-                ).radius * 0.18);
-                distance = gooSmoothMinimum(distance, eventDistance, blend);
-            } else {
-                distance = min(distance, eventDistance);
+                    strokes[strokeIndex],
+                    params.phase,
+                    eventIndex,
+                    attached,
+                    attachmentBlend
+                );
+                if (attached) {
+                    distance = gooSmoothMinimum(distance, eventDistance, attachmentBlend);
+                } else {
+                    distance = min(distance, eventDistance);
+                }
             }
         }
         float coverage = 0.0;

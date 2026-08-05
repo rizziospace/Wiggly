@@ -55,4 +55,29 @@ private extension WiggleDocument {
         showLayersInitially: false
     )
 }
+
+private struct GooExportValidationView: View {
+    private let image = UnifiedGooMaskRenderer.exportImage(
+        document: .gooStageOneValidation,
+        size: CGSize(width: 600, height: 600),
+        phase: 0.36
+    )
+
+    var body: some View {
+        ZStack {
+            Color.white
+            if let image {
+                Image(decorative: image, scale: 1)
+                    .resizable()
+                    .interpolation(.none)
+                    .aspectRatio(contentMode: .fit)
+            }
+        }
+        .frame(width: 600, height: 600)
+    }
+}
+
+#Preview("Unified Goo — Export") {
+    GooExportValidationView()
+}
 #endif
