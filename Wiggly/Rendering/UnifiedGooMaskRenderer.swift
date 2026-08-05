@@ -63,10 +63,22 @@ final class UnifiedGooMaskRenderer {
 
     private struct MaskParams {
         var segmentCount: UInt32
+        var strokeCount: UInt32
         var width: UInt32
         var height: UInt32
         var antialiasPixels: Float
         var phase: Float
+    }
+
+    private struct GooStrokeInfo {
+        var segmentStart: UInt32
+        var segmentCount: UInt32
+        var totalLength: Float
+        var seed: Float
+        var speed: Float
+        var waviness: Float
+        var waveLength: Float
+        var droplets: Float
     }
 
     private struct PreparedBatch {
@@ -75,6 +87,8 @@ final class UnifiedGooMaskRenderer {
         var mask: MTLTexture
         var segments: MTLBuffer
         var segmentCount: Int
+        var strokes: MTLBuffer
+        var strokeCount: Int
     }
 
     private struct GeometrySignature: Equatable {
@@ -188,6 +202,8 @@ final class UnifiedGooMaskRenderer {
                 mask: batch.mask,
                 segmentBuffer: batch.segments,
                 segmentCount: batch.segmentCount,
+                strokeBuffer: batch.strokes,
+                strokeCount: batch.strokeCount,
                 phase: transform.phase
             )
         }
@@ -213,10 +229,16 @@ final class UnifiedGooMaskRenderer {
             contentOffset: .zero
         )
         let segments = makeSegments(for: source, transform: transform, drawableWidth: target.width)
+        let strokeInfo = makeStrokeInfo(source: source, segmentStart: 0, segments: segments)
         guard !segments.isEmpty,
               let buffer = device.makeBuffer(
                 bytes: segments,
                 length: segments.count * MemoryLayout<GooSegment>.stride,
+                options: .storageModeShared
+              ),
+              let strokeBuffer = device.makeBuffer(
+                bytes: [strokeInfo],
+                length: MemoryLayout<GooStrokeInfo>.stride,
                 options: .storageModeShared
               ) else { return }
         let mask = ensurePreviewMask(width: target.width, height: target.height)
@@ -225,6 +247,8 @@ final class UnifiedGooMaskRenderer {
             mask: mask,
             segmentBuffer: buffer,
             segmentCount: segments.count,
+            strokeBuffer: strokeBuffer,
+            strokeCount: 1,
             phase: transform.phase
         )
 
@@ -253,13 +277,27 @@ final class UnifiedGooMaskRenderer {
     ) -> [PreparedBatch] {
         var result: [PreparedBatch] = []
         for batch in sourceBatches {
-            let segments = batch.strokes.flatMap {
-                makeSegments(for: $0, transform: transform, drawableWidth: drawableSize.x)
+            var segments: [GooSegment] = []
+            var strokeInfos: [GooStrokeInfo] = []
+            for source in batch.strokes {
+                let strokeSegments = makeSegments(for: source, transform: transform, drawableWidth: drawableSize.x)
+                guard !strokeSegments.isEmpty else { continue }
+                strokeInfos.append(makeStrokeInfo(
+                    source: source,
+                    segmentStart: segments.count,
+                    segments: strokeSegments
+                ))
+                segments.append(contentsOf: strokeSegments)
             }
-            guard !segments.isEmpty,
+            guard !segments.isEmpty, !strokeInfos.isEmpty,
                   let buffer = device.makeBuffer(
                     bytes: segments,
                     length: segments.count * MemoryLayout<GooSegment>.stride,
+                    options: .storageModeShared
+                  ),
+                  let strokeBuffer = device.makeBuffer(
+                    bytes: strokeInfos,
+                    length: strokeInfos.count * MemoryLayout<GooStrokeInfo>.stride,
                     options: .storageModeShared
                   ),
                   let mask = makeMask(width: drawableSize.x, height: drawableSize.y) else { continue }
@@ -268,10 +306,29 @@ final class UnifiedGooMaskRenderer {
                 color: batch.color,
                 mask: mask,
                 segments: buffer,
-                segmentCount: segments.count
+                segmentCount: segments.count,
+                strokes: strokeBuffer,
+                strokeCount: strokeInfos.count
             ))
         }
         return result
+    }
+
+    private func makeStrokeInfo(
+        source: SourceStroke,
+        segmentStart: Int,
+        segments: [GooSegment]
+    ) -> GooStrokeInfo {
+        GooStrokeInfo(
+            segmentStart: UInt32(segmentStart),
+            segmentCount: UInt32(segments.count),
+            totalLength: segments.last?.totalLength ?? 0,
+            seed: stableSeed(source.stroke),
+            speed: Float(source.stroke.brush.resolvedGooSpeed),
+            waviness: Float(source.stroke.brush.resolvedGooWaviness),
+            waveLength: Float(source.stroke.brush.resolvedGooWaveLength),
+            droplets: Float(source.stroke.brush.resolvedGooDroplets)
+        )
     }
 
     private func makeSegments(
@@ -522,6 +579,8 @@ final class UnifiedGooMaskRenderer {
         mask: MTLTexture,
         segmentBuffer: MTLBuffer,
         segmentCount: Int,
+        strokeBuffer: MTLBuffer,
+        strokeCount: Int,
         phase: Float
     ) {
         let threadsPerGroup = MTLSize(width: 8, height: 8, depth: 1)
@@ -535,6 +594,7 @@ final class UnifiedGooMaskRenderer {
         }
         var params = MaskParams(
             segmentCount: UInt32(segmentCount),
+            strokeCount: UInt32(strokeCount),
             width: UInt32(mask.width),
             height: UInt32(mask.height),
             antialiasPixels: 1.25,
@@ -544,7 +604,8 @@ final class UnifiedGooMaskRenderer {
         encoder.label = "Unified Goo Baseline SDF"
         encoder.setComputePipelineState(maskPipeline)
         encoder.setBuffer(segmentBuffer, offset: 0, index: 0)
-        encoder.setBytes(&params, length: MemoryLayout<MaskParams>.stride, index: 1)
+        encoder.setBuffer(strokeBuffer, offset: 0, index: 1)
+        encoder.setBytes(&params, length: MemoryLayout<MaskParams>.stride, index: 2)
         encoder.setTexture(mask, index: 0)
         encoder.dispatchThreads(threads, threadsPerThreadgroup: threadsPerGroup)
         encoder.endEncoding()
@@ -605,10 +666,22 @@ final class UnifiedGooMaskRenderer {
 
     struct MaskParams {
         uint segmentCount;
+        uint strokeCount;
         uint width;
         uint height;
         float antialiasPixels;
         float phase;
+    };
+
+    struct GooStrokeInfo {
+        uint segmentStart;
+        uint segmentCount;
+        float totalLength;
+        float seed;
+        float speed;
+        float waviness;
+        float waveLength;
+        float droplets;
     };
 
     kernel void unifiedGooClearMask(
@@ -655,9 +728,128 @@ final class UnifiedGooMaskRenderer {
         return length(p - center) - radius;
     }
 
+    inline float gooSmoothMinimum(float a, float b, float blend) {
+        if (blend <= 0.0001) { return min(a, b); }
+        float h = clamp(0.5 + 0.5 * (b - a) / blend, 0.0, 1.0);
+        return mix(b, a, h) - blend * h * (1.0 - h);
+    }
+
+    inline float circleDistance(float2 p, float2 center, float radius) {
+        return length(p - center) - radius;
+    }
+
+    inline float neckDistance(
+        float2 p,
+        float2 a,
+        float2 b,
+        float radiusA,
+        float radiusB) {
+        float2 axis = b - a;
+        float denominator = max(1e-8, dot(axis, axis));
+        float t = clamp(dot(p - a, axis) / denominator, 0.0, 1.0);
+        return length(p - mix(a, b, t)) - mix(radiusA, radiusB, t);
+    }
+
+    struct StrokeFrame {
+        float2 position;
+        float2 normal;
+        float radius;
+    };
+
+    inline StrokeFrame strokeFrameAtArc(
+        device const GooSegment *segments,
+        device const GooStrokeInfo &stroke,
+        float arc,
+        float phase) {
+        StrokeFrame frame;
+        frame.position = float2(0.0);
+        frame.normal = float2(0.0, 1.0);
+        frame.radius = 1.0;
+        float target = clamp(arc, 0.0, stroke.totalLength);
+        uint lastIndex = stroke.segmentStart + max(1u, stroke.segmentCount) - 1u;
+        for (uint local = 0; local < stroke.segmentCount; ++local) {
+            uint index = stroke.segmentStart + local;
+            device const GooSegment &segment = segments[index];
+            if (target <= segment.arcB || index == lastIndex) {
+                float denominator = max(1e-6, segment.arcB - segment.arcA);
+                float t = clamp((target - segment.arcA) / denominator, 0.0, 1.0);
+                float pulse = bodyPulse(target, segment, phase);
+                frame.radius = mix(segment.radiusA, segment.radiusB, t) * (1.0 + pulse * 0.34);
+                frame.normal = normalize(mix(segment.normalA, segment.normalB, t));
+                float leanSign = fract(segment.seed * 19.19) < 0.5 ? -1.0 : 1.0;
+                frame.position = mix(segment.a, segment.b, t)
+                    + frame.normal * leanSign * frame.radius * pulse * 0.10;
+                return frame;
+            }
+        }
+        return frame;
+    }
+
+    inline float singleDropletEventDistance(
+        float2 p,
+        device const GooSegment *segments,
+        device const GooStrokeInfo &stroke,
+        float phase,
+        thread bool &attached) {
+        attached = false;
+        if (stroke.droplets < 0.01 || stroke.totalLength < 8.0) { return INFINITY; }
+        float sourceFraction = mix(0.16, 0.48, fract(stroke.seed * 13.73));
+        float destinationFraction = fract(sourceFraction + mix(0.34, 0.62, fract(stroke.seed * 29.17)));
+        float sourceArc = sourceFraction * stroke.totalLength;
+        float destinationArc = destinationFraction * stroke.totalLength;
+        StrokeFrame source = strokeFrameAtArc(segments, stroke, sourceArc, phase);
+        StrokeFrame destination = strokeFrameAtArc(segments, stroke, destinationArc, phase);
+        float side = fract(stroke.seed * 41.91) < 0.5 ? -1.0 : 1.0;
+        float eventTime = fract(phase * mix(0.55, 1.25, clamp(stroke.speed * 0.5, 0.0, 1.0))
+            + stroke.seed * 5.37);
+        float dropletRadius = source.radius * mix(0.30, 0.48, fract(stroke.seed * 71.11));
+        float2 start = source.position + source.normal * side * source.radius * 0.70;
+        float2 detached = source.position + source.normal * side * source.radius * 3.3;
+        float destinationSide = -side;
+        float2 arrival = destination.position + destination.normal * destinationSide * destination.radius * 3.0;
+        float2 end = destination.position + destination.normal * destinationSide * destination.radius * 0.72;
+        float2 center;
+        float radius = dropletRadius;
+        float distance;
+
+        if (eventTime < 0.20) {
+            float u = smoothstep(0.0, 0.20, eventTime);
+            center = mix(start, source.position + source.normal * side * source.radius * 1.35, u);
+            radius *= u;
+            attached = true;
+            float circle = circleDistance(p, center, radius);
+            float neck = neckDistance(p, source.position, center, source.radius * 0.42, max(0.1, radius * 0.74));
+            distance = gooSmoothMinimum(circle, neck, max(0.5, radius * 0.34));
+        } else if (eventTime < 0.42) {
+            float u = smoothstep(0.20, 0.42, eventTime);
+            center = mix(source.position + source.normal * side * source.radius * 1.35, detached, u);
+            attached = true;
+            float circle = circleDistance(p, center, radius);
+            float neckRadius = radius * mix(0.68, 0.035, u);
+            float neck = neckDistance(p, source.position, center, source.radius * 0.34, neckRadius);
+            distance = gooSmoothMinimum(circle, neck, max(0.25, radius * mix(0.30, 0.03, u)));
+        } else if (eventTime < 0.84) {
+            float u = smoothstep(0.42, 0.84, eventTime);
+            float2 linear = mix(detached, arrival, u);
+            float2 travelNormal = normalize(source.normal + destination.normal * 0.35);
+            center = linear + travelNormal * side * sin(u * M_PI_F) * source.radius * 2.2;
+            distance = circleDistance(p, center, radius);
+        } else {
+            float u = smoothstep(0.84, 1.0, eventTime);
+            center = mix(arrival, end, u);
+            radius *= 1.0 - u * 0.52;
+            attached = true;
+            float circle = circleDistance(p, center, radius);
+            float neck = neckDistance(p, destination.position, center, destination.radius * 0.38, radius * mix(0.08, 0.72, u));
+            distance = gooSmoothMinimum(circle, neck, max(0.25, radius * 0.30));
+        }
+        return distance;
+    }
+
     kernel void unifiedGooBaselineMask(
         device const GooSegment *segments [[buffer(0)]],
-        constant MaskParams &params [[buffer(1)]],
+        device const GooStrokeInfo *strokes [[buffer(1)]],
+        constant MaskParams &params [[buffer(2)]],
         texture2d<half, access::write> mask [[texture(0)]],
         uint2 gid [[thread_position_in_grid]]) {
         if (gid.x >= params.width || gid.y >= params.height) { return; }
@@ -665,6 +857,27 @@ final class UnifiedGooMaskRenderer {
         float distance = INFINITY;
         for (uint index = 0; index < params.segmentCount; ++index) {
             distance = min(distance, variableCapsuleDistance(p, segments[index], params.phase));
+        }
+        for (uint index = 0; index < params.strokeCount; ++index) {
+            bool attached = false;
+            float eventDistance = singleDropletEventDistance(
+                p,
+                segments,
+                strokes[index],
+                params.phase,
+                attached
+            );
+            if (attached) {
+                float blend = max(0.5, strokeFrameAtArc(
+                    segments,
+                    strokes[index],
+                    strokes[index].totalLength * mix(0.16, 0.48, fract(strokes[index].seed * 13.73)),
+                    params.phase
+                ).radius * 0.18);
+                distance = gooSmoothMinimum(distance, eventDistance, blend);
+            } else {
+                distance = min(distance, eventDistance);
+            }
         }
         float coverage = 0.0;
         if (distance < params.antialiasPixels) {
