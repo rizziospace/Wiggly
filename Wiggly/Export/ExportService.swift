@@ -42,10 +42,11 @@ struct ExportSettings {
     var width = 1080
     var height = 1080
     var framesPerSecond = 30
-    var duration = 3.0
-    var bitrateMbps = 12.0
+    var duration = 1.0
+    var bitrateMbps = 35.0
     var codec: VideoCodec = .h264
     var transparentBackground = false
+    var randomizeStrokePhase = false
     var filename = "Wiggly"
 
     var frameCount: Int {
@@ -62,6 +63,7 @@ struct ExportSettings {
 enum ExportError: LocalizedError {
     case invalidDimensions
     case destinationCreation
+    case gifMemoryLimit
     case writerFailure(String)
     case cancelled
 
@@ -69,6 +71,7 @@ enum ExportError: LocalizedError {
         switch self {
         case .invalidDimensions: "Export dimensions must be between 256 and 4096 pixels. Video dimensions must be even."
         case .destinationCreation: "Wiggly couldn’t create the export file."
+        case .gifMemoryLimit: "This GIF is too large to export safely. Reduce its resolution, frame rate, or duration."
         case .writerFailure(let message): "Video export failed: \(message)"
         case .cancelled: "Export cancelled."
         }
@@ -105,29 +108,108 @@ enum ExportService {
             .appending(path: "\(name)-\(UUID().uuidString).\(fileExtension)")
     }
 
-    private static func image(document: WiggleDocument, settings: ExportSettings, frame: Int) throws -> CGImage {
+    private static func videoWorkingURL(name: String, extension fileExtension: String) throws -> URL {
+        guard let caches = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first else {
+            throw ExportError.destinationCreation
+        }
+        let folder = caches.appending(path: "WigglyExports", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        return folder.appending(path: "\(name)-\(UUID().uuidString).\(fileExtension)")
+    }
+
+    private static func image(
+        document: WiggleDocument,
+        settings: ExportSettings,
+        frame: Int,
+        metalRenderer: MetalBrushExportRenderer? = nil
+    ) throws -> CGImage {
         try Task.checkCancellation()
-        let phase = Double(frame) / Double(settings.frameCount)
+        // Export duration owns the timeline: every exported animation covers
+        // exactly one normalized brush loop, regardless of canvas playback speed.
+        let phase = settings.frameCount <= 1
+            ? 0
+            : Double(frame) / Double(settings.frameCount)
         var renderDocument = document
         if settings.format == .mp4 {
             renderDocument.backgroundVisible = true
         }
         let exportsAlpha = settings.format == .movAlpha
             || (settings.transparentBackground && settings.format != .mp4)
-        guard let image = AnimatedDrawingRenderer.image(
+        let outputSize = CGSize(width: settings.width, height: settings.height)
+        // GIF must render directly at its final pixel size. Rendering procedural
+        // grain at 2x and averaging it down erases one-pixel flecks and thin
+        // animated strands before the encoder receives them. PNG can retain the
+        // smoother supersampled path because it is not palette-quantized.
+        let usesRasterSupersampling = settings.format == .png
+            || settings.format == .pngSequence
+        let isReducingSize = settings.width < document.width || settings.height < document.height
+        let maximumScale = min(
+            2.0,
+            4096.0 / Double(settings.width),
+            4096.0 / Double(settings.height)
+        )
+        // Lossless raster exports are supersampled before their final downsample.
+        // Metal renderers receive the same larger target and therefore keep
+        // CPU/GPU layers at one common scale.
+        let renderScale = usesRasterSupersampling && isReducingSize
+            ? max(1.0, maximumScale)
+            : 1.0
+        let renderSize = CGSize(
+            width: (Double(settings.width) * renderScale).rounded(),
+            height: (Double(settings.height) * renderScale).rounded()
+        )
+
+        let renderedImage = metalRenderer?.image(
             document: renderDocument,
             phase: phase,
-            outputSize: CGSize(width: settings.width, height: settings.height),
-            transparent: exportsAlpha
+            outputSize: renderSize,
+            transparent: exportsAlpha,
+            randomizeStrokePhase: settings.randomizeStrokePhase
+        ) ?? AnimatedDrawingRenderer.image(
+            document: renderDocument,
+            phase: phase,
+            outputSize: renderSize,
+            transparent: exportsAlpha,
+            randomizeStrokePhase: settings.randomizeStrokePhase
+        )
+        guard let renderedImage else {
+            throw ExportError.destinationCreation
+        }
+        guard renderSize != outputSize else { return renderedImage }
+        return try highQualityDownsample(renderedImage, to: outputSize)
+    }
+
+    private static func highQualityDownsample(_ image: CGImage, to size: CGSize) throws -> CGImage {
+        guard let context = CGContext(
+            data: nil,
+            width: Int(size.width),
+            height: Int(size.height),
+            bitsPerComponent: 8,
+            bytesPerRow: 0,
+            space: CGColorSpace(name: CGColorSpace.sRGB)!,
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
         ) else {
             throw ExportError.destinationCreation
         }
-        return image
+        context.interpolationQuality = .high
+        context.setAllowsAntialiasing(true)
+        context.setShouldAntialias(true)
+        context.draw(image, in: CGRect(origin: .zero, size: size))
+        guard let downsampled = context.makeImage() else {
+            throw ExportError.destinationCreation
+        }
+        return downsampled
     }
 
     private static func exportPNG(document: WiggleDocument, settings: ExportSettings) throws -> URL {
         let url = temporaryURL(name: settings.sanitizedFilename, extension: "png")
-        let image = try image(document: document, settings: settings, frame: 0)
+        let metalRenderer = makeMetalRendererIfNeeded(for: document)
+        let image = try image(
+            document: document,
+            settings: settings,
+            frame: 0,
+            metalRenderer: metalRenderer
+        )
         guard let data = UIImage(cgImage: image).pngData() else { throw ExportError.destinationCreation }
         try data.write(to: url, options: .atomic)
         return url
@@ -138,31 +220,43 @@ enum ExportService {
         settings: ExportSettings,
         progress: @escaping (Double) -> Void
     ) async throws -> URL {
-        let url = temporaryURL(name: settings.sanitizedFilename, extension: "gif")
-        guard let destination = CGImageDestinationCreateWithURL(
-            url as CFURL,
-            UTType.gif.identifier as CFString,
-            settings.frameCount,
-            nil
-        ) else { throw ExportError.destinationCreation }
-
-        let fileProperties: CFDictionary = [
-            kCGImagePropertyGIFDictionary: [kCGImagePropertyGIFLoopCount: 0]
-        ] as CFDictionary
-        CGImageDestinationSetProperties(destination, fileProperties)
-        let frameProperties: CFDictionary = [
-            kCGImagePropertyGIFDictionary: [
-                kCGImagePropertyGIFDelayTime: 1.0 / Double(settings.framesPerSecond)
-            ]
-        ] as CFDictionary
-
-        for frame in 0..<settings.frameCount {
-            try Task.checkCancellation()
-            CGImageDestinationAddImage(destination, try image(document: document, settings: settings, frame: frame), frameProperties)
-            progress(Double(frame + 1) / Double(settings.frameCount))
-            await Task.yield()
+        // GIF encoding and rendering retain working frame data while assembling
+        // the animation. Reject jobs whose uncompressed frame set exceeds 512 MiB so iOS can
+        // report a useful error instead of terminating the process for memory.
+        let bytesPerFrame = Int64(settings.width) * Int64(settings.height) * 4
+        let uncompressedBytes = bytesPerFrame.multipliedReportingOverflow(
+            by: Int64(settings.frameCount)
+        )
+        guard !uncompressedBytes.overflow,
+              uncompressedBytes.partialValue <= 512 * 1_024 * 1_024 else {
+            throw ExportError.gifMemoryLimit
         }
-        guard CGImageDestinationFinalize(destination) else { throw ExportError.destinationCreation }
+
+        let url = temporaryURL(name: settings.sanitizedFilename, extension: "gif")
+        var completed = false
+        defer {
+            if !completed { try? FileManager.default.removeItem(at: url) }
+        }
+        let metalRenderer = makeMetalRendererIfNeeded(for: document)
+        try await GifskiGIFEncoder.encode(
+            to: url,
+            width: settings.width,
+            height: settings.height,
+            frameCount: settings.frameCount,
+            framesPerSecond: settings.framesPerSecond,
+            frame: { frame in
+                try autoreleasepool {
+                    try image(
+                        document: document,
+                        settings: settings,
+                        frame: frame,
+                        metalRenderer: metalRenderer
+                    )
+                }
+            },
+            progress: progress
+        )
+        completed = true
         return url
     }
 
@@ -177,9 +271,15 @@ enum ExportService {
         defer { try? FileManager.default.removeItem(at: folder) }
 
         let digits = max(4, String(settings.frameCount).count)
+        let metalRenderer = makeMetalRendererIfNeeded(for: document)
         for frame in 0..<settings.frameCount {
             try Task.checkCancellation()
-            let cgImage = try image(document: document, settings: settings, frame: frame)
+            let cgImage = try image(
+                document: document,
+                settings: settings,
+                frame: frame,
+                metalRenderer: metalRenderer
+            )
             guard let data = UIImage(cgImage: cgImage).pngData() else { throw ExportError.destinationCreation }
             let name = String(format: "frame_%0*d.png", digits, frame)
             try data.write(to: folder.appending(path: name), options: .atomic)
@@ -192,29 +292,77 @@ enum ExportService {
         return zipURL
     }
 
+    static func exportPNGFrames(
+        document: WiggleDocument,
+        settings: ExportSettings,
+        progress: @escaping (Double) -> Void
+    ) async throws -> [URL] {
+        guard (256...4096).contains(settings.width),
+              (256...4096).contains(settings.height) else {
+            throw ExportError.invalidDimensions
+        }
+
+        let folder = FileManager.default.temporaryDirectory
+            .appending(path: "\(settings.sanitizedFilename)-frames-\(UUID().uuidString)", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        var urls: [URL] = []
+        urls.reserveCapacity(settings.frameCount)
+
+        do {
+            let digits = max(4, String(settings.frameCount).count)
+            let metalRenderer = makeMetalRendererIfNeeded(for: document)
+            for frame in 0..<settings.frameCount {
+                try Task.checkCancellation()
+                let cgImage = try image(
+                    document: document,
+                    settings: settings,
+                    frame: frame,
+                    metalRenderer: metalRenderer
+                )
+                guard let data = UIImage(cgImage: cgImage).pngData() else {
+                    throw ExportError.destinationCreation
+                }
+                let url = folder.appending(path: String(format: "frame_%0*d.png", digits, frame))
+                try data.write(to: url, options: .atomic)
+                urls.append(url)
+                progress(Double(frame + 1) / Double(settings.frameCount))
+                await Task.yield()
+            }
+            return urls
+        } catch {
+            try? FileManager.default.removeItem(at: folder)
+            throw error
+        }
+    }
+
     private static func exportVideo(
         document: WiggleDocument,
         settings: ExportSettings,
         progress: @escaping (Double) -> Void
     ) async throws -> URL {
         let exportsAlpha = settings.format == .movAlpha
-        let url = temporaryURL(
-            name: settings.sanitizedFilename,
-            extension: exportsAlpha ? "mov" : "mp4"
+        let writerURL = try videoWorkingURL(
+            name: exportsAlpha ? settings.sanitizedFilename : "\(settings.sanitizedFilename)-source",
+            extension: "mov"
         )
+        let finalURL = exportsAlpha
+            ? writerURL
+            : try videoWorkingURL(name: settings.sanitizedFilename, extension: "mp4")
+        if !exportsAlpha {
+            try? FileManager.default.removeItem(at: finalURL)
+        }
+        defer {
+            if !exportsAlpha { try? FileManager.default.removeItem(at: writerURL) }
+        }
         let writer = try AVAssetWriter(
-            outputURL: url,
-            fileType: exportsAlpha ? .mov : .mp4
+            outputURL: writerURL,
+            fileType: .mov
         )
-        let outputSettings: [String: Any] = [
-            AVVideoCodecKey: exportsAlpha ? AVVideoCodecType.hevcWithAlpha : settings.codec.avCodec,
-            AVVideoWidthKey: settings.width,
-            AVVideoHeightKey: settings.height,
-            AVVideoCompressionPropertiesKey: [
-                AVVideoAverageBitRateKey: Int(settings.bitrateMbps * 1_000_000),
-                AVVideoExpectedSourceFrameRateKey: settings.framesPerSecond
-            ]
-        ]
+        writer.shouldOptimizeForNetworkUse = true
+        let outputSettings = try videoOutputSettings(settings: settings, exportsAlpha: exportsAlpha)
+        guard writer.canApply(outputSettings: outputSettings, forMediaType: .video) else {
+            throw ExportError.writerFailure("This device can’t encode the requested H.264 dimensions.")
+        }
         let input = AVAssetWriterInput(mediaType: .video, outputSettings: outputSettings)
         input.expectsMediaDataInRealTime = false
         let adaptor = AVAssetWriterInputPixelBufferAdaptor(
@@ -230,6 +378,7 @@ enum ExportService {
         writer.add(input)
         guard writer.startWriting() else { throw ExportError.writerFailure(writer.error?.localizedDescription ?? "Unknown error") }
         writer.startSession(atSourceTime: .zero)
+        let metalRenderer = makeMetalRendererIfNeeded(for: document)
 
         for frame in 0..<settings.frameCount {
             try Task.checkCancellation()
@@ -242,7 +391,12 @@ enum ExportService {
             CVPixelBufferPoolCreatePixelBuffer(nil, pool, &optionalBuffer)
             guard let buffer = optionalBuffer else { throw ExportError.destinationCreation }
             try draw(
-                try image(document: document, settings: settings, frame: frame),
+                try image(
+                    document: document,
+                    settings: settings,
+                    frame: frame,
+                    metalRenderer: metalRenderer
+                ),
                 into: buffer,
                 document: document,
                 preservesAlpha: exportsAlpha
@@ -262,7 +416,83 @@ enum ExportService {
         guard writer.status == .completed else {
             throw ExportError.writerFailure(writer.error?.localizedDescription ?? "Unknown error")
         }
-        return url
+        try validateVideoFile(at: writerURL)
+
+        if exportsAlpha { return writerURL }
+        let sourceAsset = AVURLAsset(url: writerURL)
+        guard let exportSession = AVAssetExportSession(
+            asset: sourceAsset,
+            presetName: AVAssetExportPresetPassthrough
+        ), exportSession.supportedFileTypes.contains(.mp4) else {
+            throw ExportError.writerFailure("Apple’s MP4 export preset is unavailable on this device.")
+        }
+        exportSession.shouldOptimizeForNetworkUse = true
+        do {
+            try await exportSession.export(to: finalURL, as: .mp4)
+        } catch {
+            throw ExportError.writerFailure("MP4 packaging failed: \(error.localizedDescription)")
+        }
+        try validateVideoFile(at: finalURL)
+        return finalURL
+    }
+
+    private static func makeMetalRendererIfNeeded(
+        for document: WiggleDocument
+    ) -> MetalBrushExportRenderer? {
+        guard MetalBrushExportRenderer.isNeeded(for: document) else { return nil }
+        return MetalBrushExportRenderer()
+    }
+
+    private static func videoOutputSettings(
+        settings: ExportSettings,
+        exportsAlpha: Bool
+    ) throws -> [String: Any] {
+        if exportsAlpha {
+            return [
+                AVVideoCodecKey: AVVideoCodecType.hevcWithAlpha,
+                AVVideoWidthKey: settings.width,
+                AVVideoHeightKey: settings.height,
+                AVVideoCompressionPropertiesKey: [
+                    AVVideoAverageBitRateKey: Int(settings.bitrateMbps * 1_000_000),
+                    AVVideoExpectedSourceFrameRateKey: settings.framesPerSecond
+                ]
+            ]
+        }
+
+        let uses4KPreset = settings.width > 1920 || settings.height > 1920
+        let preset: AVOutputSettingsPreset = uses4KPreset ? .preset3840x2160 : .preset1920x1080
+        guard let assistant = AVOutputSettingsAssistant(preset: preset),
+              var output = assistant.videoSettings else {
+            throw ExportError.writerFailure("Apple’s H.264 output preset is unavailable.")
+        }
+
+        output[AVVideoWidthKey] = settings.width
+        output[AVVideoHeightKey] = settings.height
+        var compression = output[AVVideoCompressionPropertiesKey] as? [String: Any] ?? [:]
+        let presetWidth = uses4KPreset ? 3840.0 : 1920.0
+        let presetHeight = uses4KPreset ? 2160.0 : 1080.0
+        let presetBitrate = (compression[AVVideoAverageBitRateKey] as? NSNumber)?.doubleValue
+            ?? (uses4KPreset ? 42_000_000 : 10_500_000)
+        let pixelRatio = Double(settings.width * settings.height) / (presetWidth * presetHeight)
+        let frameRateRatio = Double(settings.framesPerSecond) / 30
+        let recommendedBitrate = presetBitrate * pixelRatio * frameRateRatio
+        compression[AVVideoAverageBitRateKey] = Int(min(
+            settings.bitrateMbps * 1_000_000,
+            max(8_000_000, recommendedBitrate * 1.2)
+        ))
+        compression[AVVideoExpectedSourceFrameRateKey] = settings.framesPerSecond
+        compression[AVVideoMaxKeyFrameIntervalKey] = settings.framesPerSecond
+        output[AVVideoCompressionPropertiesKey] = compression
+        return output
+    }
+
+    private static func validateVideoFile(at url: URL) throws {
+        guard FileManager.default.fileExists(atPath: url.path),
+              let attributes = try? FileManager.default.attributesOfItem(atPath: url.path),
+              let byteCount = attributes[.size] as? NSNumber,
+              byteCount.int64Value > 1_024 else {
+            throw ExportError.writerFailure("The encoder did not create a complete video file.")
+        }
     }
 
     private static func draw(

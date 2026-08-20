@@ -43,10 +43,11 @@ final class MetalLiveBufferRing {
 /// full-canvas Core Graphics image every frame. Geometry is uploaded when a
 /// stroke changes; animation is driven only by the `phase` uniform.
 final class MetalProceduralBrushRenderer {
-    static let supportedKinds: Set<BrushKind> = [.goo, .glitter, .gradient, .faded]
+    static let supportedKinds: Set<BrushKind> = [.solidColor, .goo, .glitter, .gradient, .faded, .retro]
 
     private struct Vertex {
         var position: SIMD2<Float>
+        var normal: SIMD2<Float>
         var uv: SIMD2<Float>
         var color1: SIMD4<Float>
         var color2: SIMD4<Float>
@@ -72,7 +73,7 @@ final class MetalProceduralBrushRenderer {
         var zoom: Float
         var rotation: Float
         var phase: Float
-        var padding: Float = 0
+        var waveAmount: Float = 0
     }
 
     private struct StrokeKey: Equatable {
@@ -140,7 +141,7 @@ final class MetalProceduralBrushRenderer {
             descriptor.colorAttachments[0].pixelFormat = pixelFormat
             let attachment = descriptor.colorAttachments[0]!
             attachment.isBlendingEnabled = true
-            attachment.sourceRGBBlendFactor = .sourceAlpha
+            attachment.sourceRGBBlendFactor = .one
             attachment.destinationRGBBlendFactor = .oneMinusSourceAlpha
             attachment.sourceAlphaBlendFactor = .one
             attachment.destinationAlphaBlendFactor = .oneMinusSourceAlpha
@@ -161,7 +162,7 @@ final class MetalProceduralBrushRenderer {
         var descriptors: [Descriptor] = []
         let center = CGPoint(x: CGFloat(document.width) / 2, y: CGFloat(document.height) / 2)
         for layer in document.layers where document.isLayerEffectivelyVisible(layer) {
-            for stroke in layer.strokes where Self.supportedKinds.contains(stroke.brush.kind) {
+            for stroke in layer.strokes where Self.supportedKinds.contains(stroke.brush.kind) && stroke.usesGPUAnimatedRenderer {
                 guard let last = stroke.samples.last else { continue }
                 descriptors.append(Descriptor(
                     stroke: stroke,
@@ -360,8 +361,23 @@ final class MetalProceduralBrushRenderer {
             : 1
         for index in samples.indices {
             let tangent: CGPoint
-            if let splineTangents {
-                tangent = splineTangents[index]
+            if brush.kind == .goo {
+                let incoming = index > 0
+                    ? unitDirection(from: points[index - 1], to: points[index])
+                    : unitDirection(from: points[index], to: points[index + 1])
+                let outgoing = index + 1 < points.count
+                    ? unitDirection(from: points[index], to: points[index + 1])
+                    : incoming
+                var tx = incoming.x + outgoing.x
+                var ty = incoming.y + outgoing.y
+                var tangentLength = hypot(tx, ty)
+                if tangentLength < 0.001 {
+                    let fallback = splineTangents?[index] ?? outgoing
+                    tx = fallback.x
+                    ty = fallback.y
+                    tangentLength = max(0.001, hypot(tx, ty))
+                }
+                tangent = CGPoint(x: tx / tangentLength, y: ty / tangentLength)
             } else {
                 let incoming = unitDirection(
                     from: points[max(0, index - 1)],
@@ -405,36 +421,130 @@ final class MetalProceduralBrushRenderer {
         let phaseOffset = strokePhaseRandomized
             ? Float(AnimatedDrawingRenderer.strokePhaseOffset(stroke.id))
             : 0
-        var parameters1 = SIMD4<Float>(phaseOffset, stroke.isPreview ? 1 : 0, 0, 0)
+        var parameters1 = SIMD4<Float>(
+            phaseOffset,
+            brush.resolvedEndStyle == .cut ? 1 : 0,
+            0,
+            0
+        )
         if brush.kind == .goo {
             parameters1.z = Float(brush.size * Double(scale))
             parameters1.w = Float(max(1, brush.loopCycles))
         }
+        if brush.kind == .gradient || brush.kind == .solidColor {
+            parameters1.z = brush.resolvedGradientMergesAcrossStrokes ? 1 : 0
+        }
+        if brush.kind == .solidColor {
+            parameters1.w = Float(10 + brush.resolvedWaveAmount / 100)
+        }
+        if brush.kind == .glitter {
+            parameters1.w = Float(brush.resolvedWaveAmount / 100)
+        }
+        if brush.kind == .retro {
+            parameters1.z = Float(brush.resolvedTrippyColorCount)
+        }
 
-        // GOO render-bounds fix. The body quad for each spline segment only
-        // spanned the segment's own sample span, so a round GOO lobe whose
-        // radius centered on a segment end was cut off by the quad's axial
-        // edge -- the sharp triangular fins/caps at curved joins. Each segment
-        // quad is therefore padded axially (forward and backward) so adjacent
-        // curved-segment quads overlap and the round profiled lobe is always
-        // inside some quad. The metal SDF is a pure function of the global uv,
-        // so an overlapping neighbor produces the identical coverage (no seam,
-        // and for an opaque brush no double-darkening).
-        let gooJoinPad: CGFloat = {
-            guard brush.kind == .goo else { return 0 }
-            let maxBaseHalf = baseWidths.map { $0 / 2 }.max() ?? 0
-            let waviness = CGFloat(brush.resolvedGooWaviness)
-            let thickness = CGFloat(brush.resolvedGooThickness)
-            // maximum body radius * (radius wave peak + energy pool), plus a
-            // small antialias margin. Triplet blobs are carried by their own
-            // (already padded) event quads, so for the body quad the axis pad
-            // only needs to cover the round lobe radius at segment joins.
-            let bodyRadiusMax = maxBaseHalf
-                * (0.10 + thickness * 0.80)
-                * (1.0 + 0.12 + waviness * 0.10)
-            let antialiasMargin: CGFloat = 2.0
-            return bodyRadiusMax + antialiasMargin
-        }()
+        let gooDiameter = brush.size * Double(scale)
+        let gooEvents: [GooDropletEvent]
+        // Droplet planning is the most expensive part of Goo geometry. It is
+        // useless while the stroke is still under the pencil (droplets are a
+        // committed-artwork effect and the shader does not gate them on the
+        // preview flag), so skip it for preview strokes to keep the live tip
+        // response immediate; the full planning runs once on commit.
+        if brush.kind == .goo, !stroke.isPreview, let gooStations {
+            gooEvents = GooDropletPlanner.events(
+                stations: gooStations,
+                distances: distances.map(Double.init),
+                brush: brush,
+                strokeID: stroke.id,
+                diameter: gooDiameter
+            )
+        } else {
+            gooEvents = []
+        }
+        func encodedEvent(_ event: GooDropletEvent) -> SIMD4<Float> {
+            SIMD4(
+                Float(event.arcDistance),
+                Float(-event.side),
+                Float(event.startPhase),
+                Float(event.detachmentEligible ? event.variation : -1 - event.variation)
+            )
+        }
+        func embeddedEvents(near distance: CGFloat, span: CGFloat) -> (SIMD4<Float>, SIMD4<Float>) {
+            let reach = gooDiameter * 1.35 + Double(span) * 0.5
+            let nearby = gooEvents
+                .filter { abs($0.arcDistance - Double(distance)) <= reach }
+                .sorted { abs($0.arcDistance - Double(distance)) < abs($1.arcDistance - Double(distance)) }
+            let none = SIMD4<Float>(-1, 0, 0, 0)
+            return (
+                nearby.first.map(encodedEvent) ?? none,
+                nearby.dropFirst().first.map(encodedEvent) ?? none
+            )
+        }
+
+        // Adjacent GOO segments share their center, tangent, normal, radius,
+        // and arc length exactly. One canvas pixel of axial overlap covers the
+        // antialiasing band; round joins below cover the curved exterior.
+        // Per-stroke gradient anchor: the stroke's own bounding box, projected
+        // onto its own diagonal. Baked into every vertex so the shader colors a
+        // pixel from that stroke's own field — a looping stroke fuses seamlessly,
+        // while a brand-new stroke carries a separate gradient.
+        let gradientAnchor: SIMD4<Float>
+        if brush.kind == .gradient || brush.kind == .solidColor {
+            var minX = CGFloat.greatestFiniteMagnitude
+            var minY = CGFloat.greatestFiniteMagnitude
+            var maxX = -CGFloat.greatestFiniteMagnitude
+            var maxY = -CGFloat.greatestFiniteMagnitude
+            for p in points {
+                minX = min(minX, p.x)
+                minY = min(minY, p.y)
+                maxX = max(maxX, p.x)
+                maxY = max(maxY, p.y)
+            }
+            var dx = maxX - minX
+            var dy = maxY - minY
+            let diagonal = hypot(dx, dy)
+            if diagonal < 0.001 {
+                dx = 1
+                dy = 0
+            } else {
+                dx /= diagonal
+                dy /= diagonal
+            }
+            let half = Float(diagonal * 0.5)
+            gradientAnchor = SIMD4(
+                Float((minX + maxX) * 0.5),
+                Float((minY + maxY) * 0.5),
+                Float(dx) * half,
+                Float(dy) * half
+            )
+        } else {
+            gradientAnchor = .zero
+        }
+
+        // Retro carries the third, fourth, and fifth palette colors in the free
+        // dropletCurve slots (first two ride in color1/color2). Each vertex of
+        // the whole stroke carries the same full palette so the color cycle is
+        // uniform along the ribbon.
+        func retroValue(_ color: CodableColor) -> SIMD4<Float> {
+            SIMD4(
+                Float(color.red), Float(color.green), Float(color.blue),
+                Float(color.alpha * brush.opacity * opacity)
+            )
+        }
+        let retroColorCurve: (SIMD4<Float>, SIMD4<Float>, SIMD4<Float>)
+        if brush.kind == .retro {
+            retroColorCurve = (
+                retroValue(brush.resolvedTertiaryColor),
+                retroValue(brush.resolvedQuaternaryColor),
+                retroValue(brush.resolvedQuinaryColor)
+            )
+        } else {
+            retroColorCurve = (.zero, .zero, .zero)
+        }
+
+        let gooJoinOverlap: CGFloat = brush.kind == .goo ? 1 : 0
+        let gooEventEnvelope = gooEvents.isEmpty ? 0 : CGFloat(gooDiameter * 0.28)
 
         vertices.reserveCapacity(vertices.count + (samples.count - 1) * 6 + 12)
         for index in 1..<samples.count {
@@ -442,12 +552,14 @@ final class MetalProceduralBrushRenderer {
             var end = points[index]
             let startNormal = normals[index - 1]
             let endNormal = normals[index]
-            let startHalf = widths[index - 1] / 2
-            let endHalf = widths[index] / 2
+            let startHalf = widths[index - 1] / 2 + gooEventEnvelope
+            let endHalf = widths[index] / 2 + gooEventEnvelope
             let startBaseHalf = baseWidths[index - 1] / 2
             let endBaseHalf = baseWidths[index] / 2
             var startDistance = distances[index - 1]
             var endDistance = distances[index]
+            let segmentStartDistance = startDistance
+            let segmentEndDistance = endDistance
             if index == 1 {
                 start.x -= tangents[0].x * startHalf
                 start.y -= tangents[0].y * startHalf
@@ -458,46 +570,81 @@ final class MetalProceduralBrushRenderer {
                 end.y += tangents[index].y * endHalf
                 endDistance += endHalf
             }
-            // Expand the segment quad axially on both sides so the round lobe
-            // straddling a segment join is fully covered and no gap remains
-            // between adjacent curved-segment quads.
-            if gooJoinPad > 0 {
-                if index > 1, startDistance - gooJoinPad >= 0 {
-                    start.x -= tangents[index - 1].x * gooJoinPad
-                    start.y -= tangents[index - 1].y * gooJoinPad
-                    startDistance -= gooJoinPad
+            if gooJoinOverlap > 0 {
+                if index > 1 {
+                    start.x -= tangents[index - 1].x * gooJoinOverlap
+                    start.y -= tangents[index - 1].y * gooJoinOverlap
+                    startDistance -= gooJoinOverlap
                 }
                 if index < samples.count - 1 {
-                    end.x += tangents[index].x * gooJoinPad
-                    end.y += tangents[index].y * gooJoinPad
-                    endDistance += gooJoinPad
+                    end.x += tangents[index].x * gooJoinOverlap
+                    end.y += tangents[index].y * gooJoinOverlap
+                    endDistance += gooJoinOverlap
                 }
             }
             let sl = CGPoint(x: start.x + startNormal.x * startHalf, y: start.y + startNormal.y * startHalf)
             let sr = CGPoint(x: start.x - startNormal.x * startHalf, y: start.y - startNormal.y * startHalf)
             let el = CGPoint(x: end.x + endNormal.x * endHalf, y: end.y + endNormal.y * endHalf)
             let er = CGPoint(x: end.x - endNormal.x * endHalf, y: end.y - endNormal.y * endHalf)
-            let a = vertex(sl, distance: startDistance, across: -1, color1: colors.0, color2: colors.1, parameters0: parameters, parameters1: parameters1, halfWidth: startHalf, baseHalfWidth: startBaseHalf, totalLength: totalLength, seed: seed, kind: kind)
-            let b = vertex(sr, distance: startDistance, across: 1, color1: colors.0, color2: colors.1, parameters0: parameters, parameters1: parameters1, halfWidth: startHalf, baseHalfWidth: startBaseHalf, totalLength: totalLength, seed: seed, kind: kind)
-            let c = vertex(el, distance: endDistance, across: -1, color1: colors.0, color2: colors.1, parameters0: parameters, parameters1: parameters1, halfWidth: endHalf, baseHalfWidth: endBaseHalf, totalLength: totalLength, seed: seed, kind: kind)
-            let d = vertex(er, distance: endDistance, across: 1, color1: colors.0, color2: colors.1, parameters0: parameters, parameters1: parameters1, halfWidth: endHalf, baseHalfWidth: endBaseHalf, totalLength: totalLength, seed: seed, kind: kind)
+            let segmentData = brush.kind == .goo
+                ? SIMD4<Float>(Float(segmentStartDistance), Float(segmentEndDistance), 0, 0)
+                : .zero
+            let segmentPoints = brush.kind == .goo
+                ? SIMD4<Float>(
+                    Float(points[index - 1].x), Float(points[index - 1].y),
+                    Float(points[index].x), Float(points[index].y)
+                )
+                : .zero
+            let segmentNormals = brush.kind == .goo
+                ? SIMD4<Float>(
+                    Float(startNormal.x), Float(startNormal.y),
+                    Float(endNormal.x), Float(endNormal.y)
+                )
+                : .zero
+            let embedded = embeddedEvents(
+                near: (segmentStartDistance + segmentEndDistance) * 0.5,
+                span: segmentEndDistance - segmentStartDistance
+            )
+            let gradientPoints = (brush.kind == .gradient || brush.kind == .solidColor) ? gradientAnchor : segmentPoints
+            let retroCurve: (SIMD4<Float>, SIMD4<Float>, SIMD4<Float>) = retroColorCurve
+            let a = vertex(sl, normal: startNormal, distance: startDistance, across: -1, color1: colors.0, color2: colors.1, parameters0: parameters, parameters1: parameters1, halfWidth: startHalf, baseHalfWidth: startBaseHalf, totalLength: totalLength, seed: seed, kind: kind, dropletData: segmentData, dropletCurve0: brush.kind == .retro ? retroCurve.0 : gradientPoints, dropletCurve1: brush.kind == .retro ? retroCurve.1 : segmentNormals, dropletCurve2: brush.kind == .retro ? retroCurve.2 : embedded.0, dropletCurve3: embedded.1)
+            let b = vertex(sr, normal: startNormal, distance: startDistance, across: 1, color1: colors.0, color2: colors.1, parameters0: parameters, parameters1: parameters1, halfWidth: startHalf, baseHalfWidth: startBaseHalf, totalLength: totalLength, seed: seed, kind: kind, dropletData: segmentData, dropletCurve0: brush.kind == .retro ? retroCurve.0 : gradientPoints, dropletCurve1: brush.kind == .retro ? retroCurve.1 : segmentNormals, dropletCurve2: brush.kind == .retro ? retroCurve.2 : embedded.0, dropletCurve3: embedded.1)
+            let c = vertex(el, normal: endNormal, distance: endDistance, across: -1, color1: colors.0, color2: colors.1, parameters0: parameters, parameters1: parameters1, halfWidth: endHalf, baseHalfWidth: endBaseHalf, totalLength: totalLength, seed: seed, kind: kind, dropletData: segmentData, dropletCurve0: brush.kind == .retro ? retroCurve.0 : gradientPoints, dropletCurve1: brush.kind == .retro ? retroCurve.1 : segmentNormals, dropletCurve2: brush.kind == .retro ? retroCurve.2 : embedded.0, dropletCurve3: embedded.1)
+            let d = vertex(er, normal: endNormal, distance: endDistance, across: 1, color1: colors.0, color2: colors.1, parameters0: parameters, parameters1: parameters1, halfWidth: endHalf, baseHalfWidth: endBaseHalf, totalLength: totalLength, seed: seed, kind: kind, dropletData: segmentData, dropletCurve0: brush.kind == .retro ? retroCurve.0 : gradientPoints, dropletCurve1: brush.kind == .retro ? retroCurve.1 : segmentNormals, dropletCurve2: brush.kind == .retro ? retroCurve.2 : embedded.0, dropletCurve3: embedded.1)
             vertices.append(contentsOf: [a, b, c, c, b, d])
         }
 
-        if brush.kind == .goo, let gooStations {
-            let eventDistances = distances.map(Double.init)
-            let events = GooDropletPlanner.events(
-                stations: gooStations,
-                distances: eventDistances,
-                brush: brush,
-                strokeID: stroke.id,
-                diameter: brush.size * Double(scale)
-            )
+        if brush.kind == .goo, samples.count > 2 {
+            for index in 1..<(samples.count - 1) {
+                let center = points[index]
+                let tangent = tangents[index]
+                let normal = normals[index]
+                let extent = widths[index] / 2 + gooEventEnvelope + 1
+                func joinPoint(along: CGFloat, across: CGFloat) -> CGPoint {
+                    CGPoint(
+                        x: center.x + tangent.x * along + normal.x * across,
+                        y: center.y + tangent.y * along + normal.y * across
+                    )
+                }
+                let joinData = SIMD4<Float>(Float(distances[index]), 0, 0, 0)
+                let embedded = embeddedEvents(near: distances[index], span: 0)
+                let topLeft = vertex(joinPoint(along: -extent, across: -extent), distance: -extent, across: Float(-extent), color1: colors.0, color2: colors.1, parameters0: parameters, parameters1: parameters1, halfWidth: widths[index] / 2, baseHalfWidth: baseWidths[index] / 2, totalLength: totalLength, seed: seed, kind: 5, dropletData: joinData, dropletCurve2: embedded.0, dropletCurve3: embedded.1)
+                let bottomLeft = vertex(joinPoint(along: -extent, across: extent), distance: -extent, across: Float(extent), color1: colors.0, color2: colors.1, parameters0: parameters, parameters1: parameters1, halfWidth: widths[index] / 2, baseHalfWidth: baseWidths[index] / 2, totalLength: totalLength, seed: seed, kind: 5, dropletData: joinData, dropletCurve2: embedded.0, dropletCurve3: embedded.1)
+                let topRight = vertex(joinPoint(along: extent, across: -extent), distance: extent, across: Float(-extent), color1: colors.0, color2: colors.1, parameters0: parameters, parameters1: parameters1, halfWidth: widths[index] / 2, baseHalfWidth: baseWidths[index] / 2, totalLength: totalLength, seed: seed, kind: 5, dropletData: joinData, dropletCurve2: embedded.0, dropletCurve3: embedded.1)
+                let bottomRight = vertex(joinPoint(along: extent, across: extent), distance: extent, across: Float(extent), color1: colors.0, color2: colors.1, parameters0: parameters, parameters1: parameters1, halfWidth: widths[index] / 2, baseHalfWidth: baseWidths[index] / 2, totalLength: totalLength, seed: seed, kind: 5, dropletData: joinData, dropletCurve2: embedded.0, dropletCurve3: embedded.1)
+                vertices.append(contentsOf: [
+                    topLeft, bottomLeft, topRight,
+                    topRight, bottomLeft, bottomRight
+                ])
+            }
+        }
+
+        if brush.kind == .goo {
             let diameter = CGFloat(brush.size * Double(scale))
             // Covers the monotonic arc-length travel plus the triplet's short
             // forward separation without allowing its analytical field to clip.
             let alongExtent = diameter * 2.15
-            for event in events {
+            for event in gooEvents {
                 let index = event.stationIndex
                 let nextIndex = index + 1
                 guard points.indices.contains(index), points.indices.contains(nextIndex) else { continue }
@@ -646,13 +793,22 @@ final class MetalProceduralBrushRenderer {
     }
 
     private func makeColors(brush: BrushSettings, opacity: Double) -> (SIMD4<Float>, SIMD4<Float>) {
-        func value(_ color: CodableColor) -> SIMD4<Float> {
+        func value(_ color: CodableColor, opacityMultiplier: Double = 1) -> SIMD4<Float> {
             SIMD4(
                 Float(color.red), Float(color.green), Float(color.blue),
-                Float(color.alpha * brush.opacity * opacity)
+                Float(color.alpha * brush.opacity * opacity * opacityMultiplier)
             )
         }
-        return (value(brush.color), value(brush.resolvedSecondaryColor))
+        if brush.kind == .faded {
+            return (
+                value(brush.color, opacityMultiplier: brush.resolvedFadedTextureOpacity),
+                value(brush.resolvedFadedBaseColor, opacityMultiplier: brush.resolvedFadedBaseOpacity)
+            )
+        }
+        let secondColor = brush.kind == .solidColor && !brush.resolvedColoringUsesGradient
+            ? brush.color
+            : brush.resolvedSecondaryColor
+        return (value(brush.color), value(secondColor))
     }
 
     private func makeParameters(
@@ -676,7 +832,11 @@ final class MetalProceduralBrushRenderer {
                 Float(max(1, brush.spacing))
             )
         case .gradient:
-            return SIMD4(Float(brush.resolvedGradientSpeed), 0, 0, 0)
+            return SIMD4(Float(brush.resolvedGradientCyclesPerLoop), 0, 0, 0)
+        case .solidColor:
+            return .zero
+        case .retro:
+            return SIMD4(Float(brush.resolvedGradientCyclesPerLoop), 0, 0, 0)
         case .faded:
             return SIMD4(
                 Float(brush.resolvedFadedSpeed),
@@ -693,8 +853,9 @@ final class MetalProceduralBrushRenderer {
         switch kind {
         case .goo: 0
         case .glitter: 1
-        case .gradient: 2
+        case .solidColor, .gradient: 2
         case .faded: 3
+        case .retro: 6
         default: -1
         }
     }
@@ -727,6 +888,7 @@ final class MetalProceduralBrushRenderer {
 
     private func vertex(
         _ point: CGPoint,
+        normal: CGPoint = .zero,
         distance: CGFloat,
         across: Float,
         color1: SIMD4<Float>,
@@ -746,6 +908,7 @@ final class MetalProceduralBrushRenderer {
     ) -> Vertex {
         Vertex(
             position: SIMD2(Float(point.x), Float(point.y)),
+            normal: SIMD2(Float(normal.x), Float(normal.y)),
             uv: SIMD2(Float(distance), across),
             color1: color1,
             color2: color2,
@@ -807,6 +970,7 @@ final class MetalProceduralBrushRenderer {
 
     struct VertexIn {
         float2 position;
+        float2 normal;
         float2 uv;
         float4 color1;
         float4 color2;
@@ -832,7 +996,7 @@ final class MetalProceduralBrushRenderer {
         float zoom;
         float rotation;
         float phase;
-        float padding;
+        float waveAmount;
     };
 
     struct VertexOut {
@@ -870,8 +1034,22 @@ final class MetalProceduralBrushRenderer {
         constant Uniforms &u [[buffer(1)]]) {
         VertexIn input = vertices[id];
         VertexOut out;
-        out.position = float4(canvasToClip(input.position, u), 0, 1);
-        out.canvasPosition = input.position;
+        float2 point = input.position;
+        float waveStrength = input.kind == 1.0
+            ? max(0.0, input.parameters1.w)
+            : (input.kind == 2.0 && input.parameters1.w >= 10.0
+                ? clamp(input.parameters1.w - 10.0, 0.0, 1.0)
+                : 0.0);
+        if (waveStrength > 0.0001 && u.waveAmount > 0.0001 && input.totalLength > 0.001) {
+            float progress = clamp(input.uv.x / input.totalLength, 0.0, 1.0);
+            float envelope = pow(max(0.0, sin(kPi * progress)), 0.35);
+            float amplitude = waveStrength * u.waveAmount * max(8.0, input.baseHalfWidth * 1.1);
+            float wavelength = max(72.0, input.baseHalfWidth * 10.0);
+            float angle = input.uv.x / wavelength * 2.0 * kPi - u.phase * 2.0 * kPi;
+            point += input.normal * (sin(angle) * amplitude * envelope);
+        }
+        out.position = float4(canvasToClip(point, u), 0, 1);
+        out.canvasPosition = point;
         out.uv = input.uv;
         out.color1 = input.color1;
         out.color2 = input.color2;
@@ -894,6 +1072,14 @@ final class MetalProceduralBrushRenderer {
         p = fract(p * float2(123.34, 456.21));
         p += dot(p, p + 45.32);
         return fract(p.x * p.y);
+    }
+
+    float organicNoise(float2 p) {
+        float2 i = floor(p);
+        float2 f = fract(p);
+        f = f * f * (3.0 - 2.0 * f);
+        return mix(mix(hash21(i), hash21(i + float2(1, 0)), f.x),
+                   mix(hash21(i + float2(0, 1)), hash21(i + 1.0), f.x), f.y);
     }
 
     float strokeDistance(VertexOut input, float radius) {
@@ -1018,7 +1204,7 @@ final class MetalProceduralBrushRenderer {
             splineDistance / (fieldDiameter * (0.62 + wavelengthSetting * 0.28)) * 2.0 * kPi
                 + seedPhase * 6.19 + 5.2,
             1.0);
-        float baseRadius = baseHalfWidth * (0.10 + thickness * 0.80);
+        float baseRadius = baseHalfWidth * (0.16 + thickness * 0.62);
         float radiusLongAmount = radiusAmplitude * 0.57;
         float radiusMediumAmount = radiusAmplitude * 0.33;
         float radiusDetailAmount = radiusAmplitude * 0.10;
@@ -1214,6 +1400,43 @@ final class MetalProceduralBrushRenderer {
         return gooSmoothMin(chain, outerDistance, blendRadius);
     }
 
+    float2 gooEmbeddedBud(
+        float time,
+        float splineDistance,
+        float fieldDiameter,
+        float speed,
+        float thickness,
+        float4 eventData
+    ) {
+        if (eventData.x < 0.0) { return float2(0.0); }
+        float encodedVariation = eventData.w;
+        bool canDetach = encodedVariation >= 0.0;
+        float variation = canDetach ? encodedVariation : -encodedVariation - 1.0;
+        float radiusRandom = fract(variation * 7.13 + 0.37);
+        float life = fract(time - eventData.z + 1.0);
+        float travelSpan = fieldDiameter * (1.35 + clamp(speed, 0.0, 2.0) * 0.25);
+        float movingArcDistance = eventData.x + (life - 0.5) * travelSpan;
+        float cycleVisibility = smoothstep(0.03, 0.10, life)
+            * (1.0 - smoothstep(0.90, 0.97, life));
+        float pushOut = smoothstep(0.48, 0.74, life)
+            * (1.0 - smoothstep(0.86, 0.98, life));
+        float detached = canDetach
+            ? smoothstep(0.76, 0.82, life) * (1.0 - smoothstep(0.88, 0.94, life))
+            : 0.0;
+        float rootWave = sin((life + radiusRandom) * 2.0 * kPi);
+        float rootRadius = fieldDiameter * (0.125 + radiusRandom * 0.070)
+            * (0.94 + rootWave * 0.06) * cycleVisibility;
+        float halfSpan = max(fieldDiameter * 0.08, rootRadius * (1.15 + pushOut * 0.40));
+        float profile = 1.0 - smoothstep(
+            halfSpan,
+            halfSpan + fieldDiameter * 0.08,
+            abs(splineDistance - movingArcDistance));
+        float thicknessResponse = 1.0 - clamp(thickness, 0.0, 1.0) * 0.66;
+        float bulge = rootRadius * (0.80 + pushOut * 1.10)
+            * profile * (1.0 - detached) * thicknessResponse;
+        return float2(eventData.y * bulge * 0.48, bulge * 0.55);
+    }
+
     fragment float4 proceduralFragment(VertexOut input [[stage_in]], constant Uniforms &u [[buffer(1)]]) {
         if (input.canvasPosition.x < 0.0 || input.canvasPosition.y < 0.0
             || input.canvasPosition.x > u.canvasSize.x || input.canvasPosition.y > u.canvasSize.y) {
@@ -1221,7 +1444,6 @@ final class MetalProceduralBrushRenderer {
         }
 
         float time = fract(u.phase + input.parameters1.x);
-        float along = clamp(input.uv.x / max(0.001, input.totalLength), 0.0, 1.0);
         int kind = int(round(input.kind));
 
         if (kind == 4) {
@@ -1301,9 +1523,6 @@ final class MetalProceduralBrushRenderer {
                 bridgeCenter, bridgeRadius,
                 outerCenter, outerRadius,
                 chainBlend);
-            // Match the already-rendered ribbon at this fragment's own global
-            // arc length; using the event anchor for the whole quad was the
-            // final source of over-subtracted hairline coverage.
             float bodyArcOffset = input.uv.x;
             GooStrokeFrame projectedFrame = sampleGooFrame(
                 input,
@@ -1324,52 +1543,82 @@ final class MetalProceduralBrushRenderer {
             float bodyBlend = fieldDiameter * (0.100 + travelRandom * 0.040) * visibility;
             float finalDistance = gooSmoothMin(bodyDistance, chainDistance, bodyBlend);
 
-            // Union raw distances first and derive one AA width from dFinal.
-            // bodyCoverage is used only to solve the exact source-over alpha
-            // increment for the already-rendered body, never as a shape mask.
-            float antialias = max(0.006, fwidth(finalDistance));
-            float finalCoverage = 1.0 - smoothstep(-antialias, antialias, finalDistance);
-            float bodyCoverage = 1.0 - smoothstep(-antialias, antialias, bodyDistance);
-            float existingAlpha = bodyCoverage * input.color1.a;
-            float targetAlpha = finalCoverage * input.color1.a;
-            float incrementalAlpha = clamp(
-                (targetAlpha - existingAlpha) / max(0.0001, 1.0 - existingAlpha),
-                0.0,
-                1.0);
-            // Outside the compact support of the smooth union the event pass
-            // must contribute exactly zero. Enforcing the analytical support
-            // prevents tiny frame-adjacency error from exposing an event
-            // quad edge as a long hairline beside the stroke.
-            float unionInfluence = 1.0 - smoothstep(
-                bodyDistance + bodyBlend,
-                bodyDistance + bodyBlend + antialias * 2.0,
-                chainDistance);
-            incrementalAlpha *= unionInfluence;
-            // Re-cover the small physical overlap occupied by the triplet.
-            // This seals subpixel centerline/normal differences between the
-            // ribbon mesh and its local event quad without overdrawing the
-            // event quad's full body-width region.
-            float overlapSeal = 1.0 - smoothstep(
-                -antialias,
-                antialias * 2.0,
-                chainDistance);
-            float alpha = max(incrementalAlpha, targetAlpha * overlapSeal);
-            if (alpha < 0.002) { discard_fragment(); }
-            return float4(input.color1.rgb, alpha);
+            // Evaluate one local body+triplet union, but only where the
+            // triplet can influence it. The already-rendered body remains the
+            // base layer; this pass fills the seamless fluid attachment.
+            float antialias = max(0.006, fwidth(chainDistance));
+            if (!isfinite(bodyDistance) || !isfinite(chainDistance)
+                || !isfinite(finalDistance) || !isfinite(bodyBlend)
+                || !isfinite(antialias)
+                || chainDistance > bodyBlend + antialias * 2.0) {
+                discard_fragment();
+            }
+            float coverage = 1.0 - smoothstep(-antialias, antialias, finalDistance);
+            float detachedVisibility = smoothstep(0.08, 0.45, detached);
+            float alpha = coverage * input.color1.a * detachedVisibility;
+            if (!isfinite(alpha) || alpha < 0.002) { discard_fragment(); }
+
+            return float4(input.color1.rgb * alpha, alpha);
+        }
+
+        if (kind == 5) {
+            float joinDistance = clamp(input.dropletData.x, 0.0, input.totalLength);
+            GooField joinField = evaluateGooField(
+                time,
+                joinDistance,
+                max(0.5, input.baseHalfWidth),
+                max(0.5, input.parameters1.z),
+                input.parameters0,
+                input.parameters1,
+                input.seed);
+            float2 joinBud = gooEmbeddedBud(
+                time,
+                joinDistance,
+                max(0.5, input.parameters1.z),
+                input.parameters0.x,
+                input.parameters0.y,
+                input.dropletCurve2) + gooEmbeddedBud(
+                    time,
+                joinDistance,
+                max(0.5, input.parameters1.z),
+                input.parameters0.x,
+                input.parameters0.y,
+                input.dropletCurve3);
+            float2 joinCoordinate = float2(
+                input.uv.x,
+                input.uv.y - joinField.centerOffset - joinBud.x);
+            float joinSDF = length(joinCoordinate) - joinField.radius - joinBud.y;
+            float coverage = coverageForDistance(joinSDF);
+            float alpha = coverage * input.color1.a;
+            if (!isfinite(alpha) || alpha < 0.002) { discard_fragment(); }
+            return float4(input.color1.rgb * alpha, alpha);
         }
 
         if (kind == 0) {
+            if (input.parameters1.y > 0.5
+                && (input.uv.x < 0.0 || input.uv.x > input.totalLength)) {
+                discard_fragment();
+            }
             float speed = input.parameters0.x;
             float thickness = input.parameters0.y;
             float waviness = input.parameters0.z;
             float wavelengthSetting = input.parameters0.w;
             float speedCycles = speed * 2.0 * max(1.0, input.parameters1.w);
-            float envelopeHalfWidth = max(0.5, input.halfWidth);
             float baseHalfWidth = max(0.5, input.baseHalfWidth);
             float diameter = baseHalfWidth * 2.0;
             float fieldDiameter = max(0.5, input.parameters1.z);
-            float splineDistance = clamp(input.uv.x, 0.0, input.totalLength);
-            float physicalY = input.uv.y * envelopeHalfWidth;
+            float segmentStart = clamp(input.dropletData.x, 0.0, input.totalLength);
+            float segmentEnd = clamp(input.dropletData.y, segmentStart, input.totalLength);
+            float2 segmentStartPoint = input.dropletCurve0.xy;
+            float2 segmentEndPoint = input.dropletCurve0.zw;
+            float2 segmentVector = segmentEndPoint - segmentStartPoint;
+            float segmentLengthSquared = max(0.000001, dot(segmentVector, segmentVector));
+            float segmentProgress = clamp(
+                dot(input.canvasPosition - segmentStartPoint, segmentVector)
+                    / segmentLengthSquared,
+                0.0,
+                1.0);
+            float splineDistance = mix(segmentStart, segmentEnd, segmentProgress);
             float seedPhase = input.seed * 2.0 * kPi;
 
             // The drawn path remains the immutable spine. Two broad correlated
@@ -1428,7 +1677,7 @@ final class MetalProceduralBrushRenderer {
                 splineDistance / (fieldDiameter * (0.62 + wavelengthSetting * 0.28)) * 2.0 * kPi
                     + seedPhase * 6.19 + 5.2,
                 1.0);
-            float baseRadius = baseHalfWidth * (0.10 + thickness * 0.80);
+            float baseRadius = baseHalfWidth * (0.16 + thickness * 0.62);
             float radiusLongAmount = radiusAmplitude * 0.57;
             float radiusMediumAmount = radiusAmplitude * 0.33;
             float radiusDetailAmount = radiusAmplitude * 0.10;
@@ -1450,20 +1699,45 @@ final class MetalProceduralBrushRenderer {
                 + radiusEdgeAmount * radiusEdgeAmount * loopedSineEnergy(time, radiusEdgeCycles));
             float volumeScale = rsqrt(max(0.001, meanSquare));
             float localRadius = max(0.35, baseRadius * max(0.62, 1.0 + radiusWave) * volumeScale);
+            float2 embeddedBud = gooEmbeddedBud(
+                time,
+                splineDistance,
+                fieldDiameter,
+                speed,
+                thickness,
+                input.dropletCurve2) + gooEmbeddedBud(
+                    time,
+                splineDistance,
+                fieldDiameter,
+                speed,
+                thickness,
+                input.dropletCurve3);
+            centerOffset += embeddedBud.x;
+            localRadius += embeddedBud.y;
 
-            // Continuous physical SDF with radius-matched round caps. There are
-            // no discrete blob meshes or particles to create kite silhouettes.
-            float axialDistance = input.uv.x - splineDistance;
-            float lateralDistance = physicalY - centerOffset;
-            float gooDistance = input.uv.x < 0.0 || input.uv.x > input.totalLength
-                ? length(float2(axialDistance, lateralDistance)) - localRadius
-                : abs(lateralDistance) - localRadius;
+            // Evaluate the capsule in canvas space. Interpolated trapezoid UVs
+            // are not physical distances on a curve and can expose corners as
+            // teeth; shared endpoint normals keep neighboring capsules exact.
+            float2 sharedNormal = mix(
+                input.dropletCurve1.xy,
+                input.dropletCurve1.zw,
+                segmentProgress);
+            sharedNormal *= rsqrt(max(0.000001, dot(sharedNormal, sharedNormal)));
+            float2 animatedCenter = mix(
+                segmentStartPoint,
+                segmentEndPoint,
+                segmentProgress) + sharedNormal * centerOffset;
+            float gooDistance = length(input.canvasPosition - animatedCenter) - localRadius;
             float body = coverageForDistance(gooDistance);
             float alpha = body * input.color1.a;
             if (alpha < 0.002) { discard_fragment(); }
-            return float4(input.color1.rgb, alpha);
+            return float4(input.color1.rgb * alpha, alpha);
         }
 
+        if (input.parameters1.y > 0.5
+            && (input.uv.x < 0.0 || input.uv.x > input.totalLength)) {
+            discard_fragment();
+        }
         float baseCoverage = coverageForDistance(strokeDistance(input, 1.0));
         if (baseCoverage < 0.002) { discard_fragment(); }
 
@@ -1493,42 +1767,99 @@ final class MetalProceduralBrushRenderer {
             float grain = shape * exists * (0.20 + pow(twinkle, 1.4) * 0.80) * baseCoverage;
             float3 rgb = mix(input.color2.rgb, input.color1.rgb, grain);
             float alpha = max(input.color2.a * baseCoverage, input.color1.a * grain);
-            return float4(rgb, alpha);
+            return float4(rgb * alpha, alpha);
         }
 
         if (kind == 2) {
-            float speed = input.parameters0.x;
-            float cycles = speed < 0.01 ? 0.0 : max(1.0, round(speed * 2.0));
-            float flow = cycles == 0.0 ? 0.0 : sin(time * 2.0 * kPi * cycles) * 0.28;
-            float blend = clamp(along + flow, 0.0, 1.0);
+            float cycles = input.parameters0.x;
+            float flow = cycles == 0.0 ? 0.0 : sin(time * 2.0 * kPi * cycles) * 0.04;
+            float blend;
+            if (input.parameters1.z > 0.5) {
+                // Global merge: every stroke shares one canvas-anchored field,
+                // so all strokes fuse into a single continuous gradient.
+                float2 space = input.canvasPosition / max(0.001, u.canvasSize);
+                blend = clamp(space.x * 0.62 + space.y * 0.38 + flow, 0.0, 1.0);
+            } else {
+                // Per-stroke merge: color depends only on where the pixel lies
+                // along this stroke's own bounding-box diagonal (dropletCurve0.xy
+                // = center, .zw = axis * half-length), so any pass over a given
+                // pixel writes the same color and self-overlapping loops fuse
+                // seamlessly. Each stroke has its own center + axis, so a
+                // brand-new stroke carries its own gradient.
+                float2 local = input.canvasPosition - input.dropletCurve0.xy;
+                float2 axisVec = input.dropletCurve0.zw;
+                float extent = max(0.001, dot(axisVec, axisVec));
+                blend = clamp(0.5 + 0.5 * dot(local, axisVec) / extent + flow, 0.0, 1.0);
+            }
             float4 color = mix(input.color1, input.color2, blend);
             color.a *= baseCoverage;
-            return color;
+            return float4(color.rgb * color.a, color.a);
         }
 
-        // Faded: seeded holes change in discrete frames, avoiding crawling
-        // noise while preserving the broken/crusted animated silhouette.
+        // Retro: the entire stroke is one solid color at a time, stepping
+        // through the selected palette in order as the animation plays.
+        if (kind == 6) {
+            float3 c0 = input.color1.rgb;  float a0 = input.color1.a;
+            float3 c1 = input.color2.rgb;  float a1 = input.color2.a;
+            float3 c2 = input.dropletCurve0.rgb; float a2 = input.dropletCurve0.a;
+            float3 c3 = input.dropletCurve1.rgb; float a3 = input.dropletCurve1.a;
+            float3 c4 = input.dropletCurve2.rgb; float a4 = input.dropletCurve2.a;
+            float cycles = input.parameters0.x;
+            if (cycles < 0.01) {
+                float alpha = a0 * baseCoverage;
+                return float4(c0 * alpha, alpha);
+            }
+            int count = max(2, int(round(input.parameters1.z)));
+            float pos = fract(time * cycles) * float(count);
+            int idx = int(floor(pos));
+            if (idx >= count) { idx = count - 1; }
+            float3 rgb;
+            float alpha;
+            if (idx == 0) { rgb = c0; alpha = a0; }
+            else if (idx == 1) { rgb = c1; alpha = a1; }
+            else if (idx == 2) { rgb = c2; alpha = a2; }
+            else if (idx == 3) { rgb = c3; alpha = a3; }
+            else { rgb = c4; alpha = a4; }
+            float finalAlpha = alpha * baseCoverage;
+            if (finalAlpha < 0.002) { discard_fragment(); }
+            return float4(rgb * finalAlpha, finalAlpha);
+        }
+
+        // Faded: multi-octave organic value noise erodes papery flecks and a
+        // crumbly, worn silhouette across discrete animation frames. There are
+        // no literal blobs or sin-based line shards — just an organic, noisy
+        // mask that evolves frame by frame.
         float speed = input.parameters0.x;
         float amount = input.parameters0.y;
         float density = input.parameters0.z;
         float roughness = input.parameters0.w;
         float frameCount = speed < 0.01 ? 1.0 : max(4.0, round(5.0 + speed * 5.0));
         float frame = speed < 0.01 ? 0.0 : floor(time * frameCount);
-        float cellSize = max(1.5, input.halfWidth * (0.13 + (1.0 - density) * 0.16));
+        float cellSize = max(1.5, input.halfWidth * (0.20 + (1.0 - density) * 0.20));
         float2 coordinate = float2(input.uv.x, input.uv.y * input.halfWidth) / cellSize;
-        float2 cell = floor(coordinate);
-        float2 local = fract(coordinate) - 0.5;
-        float2 animatedCell = cell + float2(frame * 37.0, frame * 71.0) + input.seed * 251.0;
-        float random = hash21(animatedCell);
-        float2 center = float2(hash21(animatedCell + 17.0), hash21(animatedCell + 43.0)) - 0.5;
-        float radius = 0.10 + hash21(animatedCell + 89.0) * (0.16 + roughness * 0.24);
-        float hole = (random < amount * (0.46 + density * 0.46) ? 1.0 : 0.0)
-            * (1.0 - smoothstep(radius, radius + 0.07, length(local - center * 0.58)));
-        float shard = abs(sin((coordinate.x + input.seed * 13.0) * 2.7 + frame * 1.9));
-        hole = max(hole, (shard > 0.985 - amount * 0.06 ? roughness * 0.78 : 0.0));
-        float alpha = input.color1.a * baseCoverage * (1.0 - hole * (0.78 + amount * 0.22));
+        float2 drift = float2(
+            cos(frame * 0.35 + input.seed * 13.0),
+            sin(frame * 0.47 + input.seed * 7.0)) * (0.4 + density * 0.9)
+            + input.seed * 41.0;
+        float coarse = organicNoise(coordinate * 0.62 + drift);
+        float medium = organicNoise(coordinate * 1.9 - drift * 1.42 + 31.0);
+        float fine = organicNoise(coordinate * 4.7 + drift * 0.6 + 97.0);
+        float organic = coarse * 0.46 + medium * 0.34 + fine * 0.20;
+        // Heavier erosion toward the stroke edge for a worn, ragged silhouette.
+        float edge = clamp(abs(input.uv.y) * 2.2 - 0.25, 0.0, 1.0);
+        float threshold = mix(0.32, amount * 0.92, edge)
+            - (1.0 - density) * 0.14
+            - (0.5 - amount) * 0.20;
+        float hole = smoothstep(threshold, threshold + 0.20, organic) * (0.70 + roughness * 0.30);
+        // Preview the same two-layer color structure as the final CPU brush:
+        // solid Base underneath, independently translucent Faded color above.
+        float fadedAlpha = input.color1.a * baseCoverage * (1.0 - hole * 0.92);
+        float baseAlpha = input.color2.a * baseCoverage;
+        float alpha = fadedAlpha + baseAlpha * (1.0 - fadedAlpha);
         if (alpha < 0.002) { discard_fragment(); }
-        return float4(input.color1.rgb, alpha);
+        float3 premultiplied = input.color1.rgb * fadedAlpha
+            + input.color2.rgb * baseAlpha * (1.0 - fadedAlpha);
+        return float4(premultiplied, alpha);
     }
     """#
 }

@@ -14,7 +14,7 @@ nonisolated enum BrushKernelRegistry {
         .jitter: JitterKernel(),
         .pulse: PulseKernel(),
         .cutMarker: CutMarkerKernel(),
-        .solidColor: SolidColorKernel(),
+        .solidColor: GradientKernel(kind: .solidColor, animates: false),
         .softAirbrush: SoftAirbrushKernel(),
         .gouache: GouacheKernel(),
         .flatChisel: FlatChiselKernel(),
@@ -30,10 +30,13 @@ nonisolated enum BrushKernelRegistry {
         .glitter: GlitterKernel(),
         .gradient: GradientKernel(),
         .polkaDots: PolkaDotsKernel(),
+        .checker: CheckerKernel(),
         .faded: FadedKernel(),
         .charcoal: CharcoalKernel(),
         .colorNoise: ColorNoiseKernel(),
-        .dryOutline: DryOutlineKernel()
+        .dryOutline: DryOutlineKernel(),
+        .retro: RetroKernel(),
+        .outlineFill: OutlineFillKernel()
     ]
 }
 
@@ -425,7 +428,7 @@ nonisolated enum GooSplineSampler {
         let diameter = brush.size * Double(scale) * pressure * tilt * taperScale(at: progress, brush: brush)
         // Goo Thickness controls only the liquid core. Metaball dimensions use
         // the physical brush diameter independently below.
-        return diameter * 0.5 * (0.10 + brush.resolvedGooThickness * 0.80)
+        return diameter * 0.5 * (0.16 + brush.resolvedGooThickness * 0.62)
     }
 
     private static func extrapolated(before point: CGPoint, next: CGPoint) -> CGPoint {
@@ -502,8 +505,8 @@ nonisolated enum GooDropletPlanner {
         let cellCount = max(1, Int(Foundation.ceil(totalLength / cellLength)))
         let edgeInset = diameter * 0.72
         let maximumTriplets = 24
-        let detachmentProbability = (0.12 + brush.resolvedGooDroplets * 0.08)
-            * (1 - brush.resolvedGooThickness * 0.50)
+        let detachmentProbability = (0.14 + brush.resolvedGooDroplets * 0.12)
+            * Foundation.pow(max(0, 1 - brush.resolvedGooThickness), 2.2)
         var result: [GooDropletEvent] = []
         result.reserveCapacity(min(cellCount, maximumTriplets))
 
@@ -564,6 +567,8 @@ nonisolated enum GooDropletPlanner {
 nonisolated struct GooMetaballMotion {
     var movingArcDistance: Double
     var visibility: Double
+    var pushOut: Double
+    var detached: Double
     var rootRadius: Double
     var bridgeRadius: Double
     var outerRadius: Double
@@ -644,6 +649,8 @@ nonisolated func gooMetaballMotion(
     return GooMetaballMotion(
         movingArcDistance: movingArcDistance,
         visibility: visibility,
+        pushOut: pushOut,
+        detached: detached,
         rootRadius: rootRadius,
         bridgeRadius: bridgeRadius,
         outerRadius: outerRadius,
@@ -668,7 +675,7 @@ nonisolated private func structureScale(for brush: BrushSettings) -> Double {
     case .jitter: referenceSize = 8
     case .pulse: referenceSize = 30
     case .cutMarker: referenceSize = 46
-    case .solidColor: referenceSize = 72
+    case .solidColor: referenceSize = 44
     case .softAirbrush: referenceSize = 110
     case .gouache: referenceSize = 78
     case .flatChisel: referenceSize = 64
@@ -684,10 +691,13 @@ nonisolated private func structureScale(for brush: BrushSettings) -> Double {
     case .glitter: referenceSize = 48
     case .gradient: referenceSize = 44
     case .polkaDots: referenceSize = 46
+    case .checker: referenceSize = 36
     case .faded: referenceSize = 34
     case .charcoal: referenceSize = 22
     case .colorNoise: referenceSize = 34
     case .dryOutline: referenceSize = 18
+    case .retro: referenceSize = 44
+    case .outlineFill: referenceSize = 32
     }
     return max(0.05, brush.size / referenceSize)
 }
@@ -1013,24 +1023,6 @@ nonisolated struct CutMarkerKernel: AnimatedBrushKernel {
     }
 }
 
-nonisolated struct SolidColorKernel: AnimatedBrushKernel {
-    let kind = BrushKind.solidColor
-
-    func draw(stroke: AnimatedStroke, phase: Double, in context: CGContext) {
-        guard stroke.samples.count > 1 else { return }
-        let brush = stroke.brush
-        let phaseAngle = phase * Double.pi * 2 * Double(max(1, brush.loopCycles))
-        let breathing = 1 + Foundation.sin(phaseAngle) * min(0.12, brush.motionAmount * 0.012)
-        drawSegmentedStroke(
-            points: stroke.samples.map(\.point),
-            samples: stroke.samples,
-            brush: brush,
-            in: context,
-            widthMultiplier: breathing
-        )
-    }
-}
-
 nonisolated struct SoftAirbrushKernel: AnimatedBrushKernel {
     let kind = BrushKind.softAirbrush
 
@@ -1327,6 +1319,43 @@ nonisolated struct GooKernel: AnimatedBrushKernel {
                 + radiusDetailAmount * radiusDetailAmount * loopedSineEnergy(phase: animationPhase, cycles: radiusDetailCycles)
         )
 
+        let dropletEvents = GooDropletPlanner.events(
+            stations: stations,
+            distances: distances,
+            brush: brush,
+            strokeID: stroke.id,
+            diameter: fieldDiameter
+        )
+        func embeddedBud(at distance: Double) -> (center: Double, radius: Double) {
+            var centerDelta = 0.0
+            var radiusDelta = 0.0
+            let thicknessResponse = 1 - brush.resolvedGooThickness * 0.66
+            for event in dropletEvents {
+                let motion = gooMetaballMotion(
+                    phase: animationPhase,
+                    event: event,
+                    diameter: fieldDiameter,
+                    totalLength: distances.last ?? 0,
+                    speed: brush.resolvedGooSpeed
+                )
+                guard motion.visibility > 0.001 else { continue }
+                let halfSpan = max(
+                    fieldDiameter * 0.08,
+                    motion.rootRadius * (1.15 + motion.pushOut * 0.40)
+                )
+                let edge = max(0.000_001, fieldDiameter * 0.08)
+                let rawProfile = min(1, max(0,
+                    1 - (abs(distance - motion.movingArcDistance) - halfSpan) / edge
+                ))
+                let profile = rawProfile * rawProfile * (3 - 2 * rawProfile)
+                let bulge = motion.rootRadius * (0.80 + motion.pushOut * 1.10)
+                    * profile * (1 - motion.detached) * thicknessResponse
+                centerDelta += event.side * bulge * 0.48
+                radiusDelta += bulge * 0.55
+            }
+            return (centerDelta, radiusDelta)
+        }
+
         var centers = [CGPoint]()
         var rawRadii = [Double]()
         centers.reserveCapacity(samples.count)
@@ -1357,8 +1386,10 @@ nonisolated struct GooKernel: AnimatedBrushKernel {
                     + seedPhase * 3.43 + 3.2
             )
             let centerAmplitude = localDiameter * (0.035 + brush.resolvedGooWaviness * 0.085)
-            let centerOffset = centerAmplitude * (centerLong * 0.64 + centerMedium * 0.36)
+            let baseCenterOffset = centerAmplitude * (centerLong * 0.64 + centerMedium * 0.36)
                 + localDiameter * (0.009 + brush.resolvedGooWaviness * 0.013) * centerDetail
+            let bud = embeddedBud(at: distance)
+            let centerOffset = baseCenterOffset + bud.center
             let normal = normals[index]
             centers.append(CGPoint(
                 x: stations[index].point.x + normal.x * centerOffset,
@@ -1391,7 +1422,7 @@ nonisolated struct GooKernel: AnimatedBrushKernel {
                 offset: distance / (fieldDiameter * (0.62 + wavelengthSetting * 0.28)) * Double.pi * 2
                     + seedPhase * 6.19 + 5.2
             )
-            let baseRadius = baseHalfWidths[index] * (0.10 + brush.resolvedGooThickness * 0.80)
+            let baseRadius = baseHalfWidths[index] * (0.16 + brush.resolvedGooThickness * 0.62)
             let radiusEdgeAmount = min(
                 0.10,
                 localDiameter * (0.008 + brush.resolvedGooWaviness * 0.010) / max(0.35, baseRadius)
@@ -1404,7 +1435,10 @@ nonisolated struct GooKernel: AnimatedBrushKernel {
                 * radiusEdgeAmount * radiusEdgeAmount
                 * loopedSineEnergy(phase: animationPhase, cycles: radiusEdgeCycles)
             let expectedVolumeScale = 1 / Foundation.sqrt(max(0.001, meanSquare))
-            let rawRadius = max(0.35, baseRadius * max(0.62, 1 + radiusWave) * expectedVolumeScale)
+            let rawRadius = max(
+                0.35,
+                baseRadius * max(0.62, 1 + radiusWave) * expectedVolumeScale + bud.radius
+            )
             rawRadii.append(rawRadius)
             targetArea += baseRadius * baseRadius
             animatedArea += rawRadius * rawRadius
@@ -1452,14 +1486,6 @@ nonisolated struct GooKernel: AnimatedBrushKernel {
                 height: radius * 2
             ))
         }
-
-        let dropletEvents = GooDropletPlanner.events(
-            stations: stations,
-            distances: distances,
-            brush: brush,
-            strokeID: stroke.id,
-            diameter: fieldDiameter
-        )
 
         // Every part of a metaball triplet samples the same animated
         // centerline independently at its own global arc distance. This keeps
@@ -1533,7 +1559,9 @@ nonisolated struct GooKernel: AnimatedBrushKernel {
                 totalLength: distances.last ?? 0,
                 speed: brush.resolvedGooSpeed
             )
-            guard motion.visibility > 0.001 else { continue }
+            let detachedProgress = min(1, max(0, (motion.detached - 0.08) / 0.37))
+            let detachedVisibility = detachedProgress * detachedProgress * (3 - 2 * detachedProgress)
+            guard motion.visibility > 0.001, detachedVisibility > 0.001 else { continue }
             guard let rootFrame = animatedFrame(at: motion.movingArcDistance),
                   let bridgeFrame = animatedFrame(
                     at: motion.movingArcDistance + motion.bridgeTangent
@@ -1553,9 +1581,9 @@ nonisolated struct GooKernel: AnimatedBrushKernel {
                 )
             }
             let circles = [
-                (center(frame: rootFrame, outwardOffset: motion.rootOutward), motion.rootRadius),
-                (center(frame: bridgeFrame, outwardOffset: motion.bridgeOutward), motion.bridgeRadius),
-                (center(frame: outerFrame, outwardOffset: motion.outerOutward), motion.outerRadius)
+                (center(frame: rootFrame, outwardOffset: motion.rootOutward), motion.rootRadius * detachedVisibility),
+                (center(frame: bridgeFrame, outwardOffset: motion.bridgeOutward), motion.bridgeRadius * detachedVisibility),
+                (center(frame: outerFrame, outwardOffset: motion.outerOutward), motion.outerRadius * detachedVisibility)
             ]
             for (center, radius) in circles where radius > 0.01 {
                 path.addEllipse(in: CGRect(
@@ -1567,7 +1595,7 @@ nonisolated struct GooKernel: AnimatedBrushKernel {
             }
         }
 
-        // Body, caps, and every triplet are rasterized as one compound shape.
+        // Body, caps, and fully detached triplets are rasterized as one compound shape.
         // Core Graphics therefore performs one antialias/color composite and
         // cannot expose the old body edge through an attached lobe.
         context.setFillColor(uiColor(brush.color, opacity: brush.opacity).cgColor)
@@ -1620,7 +1648,10 @@ nonisolated struct ScribblesKernel: AnimatedBrushKernel {
         let brush = stroke.brush
         let strokeSeed = stableStrokeSeed(stroke.id, base: brush.seed)
         let normalizedPhase = phase - Foundation.floor(phase)
-        let lineCount = 2 + (seeded(strokeSeed &+ 313, 0) > 0.56 ? 1 : 0)
+        // Keep CPU fallback/export geometry identical to the Metal canvas.
+        // The old hard-coded 2–3 strands made custom Scribbles brushes lose
+        // their outer lines whenever export took the CPU route.
+        let lineCount = brush.resolvedScribbleLineCount
         let speed = brush.resolvedScribbleSpeed
         let stepCount = speed < 0.01
             ? 1
@@ -1926,6 +1957,262 @@ nonisolated struct ParticleCloudKernel: AnimatedBrushKernel {
     }
 }
 
+nonisolated struct CheckerKernel: AnimatedBrushKernel {
+    let kind = BrushKind.checker
+
+    private struct Geometry {
+        var centers: [CGPoint]
+        var upper: [CGPoint]
+        var lower: [CGPoint]
+        var halfWidths: [CGFloat]
+        var cumulative: [Double]
+        var total: Double
+    }
+
+    func draw(stroke: AnimatedStroke, phase: Double, in context: CGContext) {
+        let brush = stroke.brush
+        guard let geometry = makeGeometry(samples: stroke.samples, brush: brush),
+              geometry.total > 0.001 else { return }
+
+        let halfW = max(0.5, brush.size / 2)
+        let cell = halfW
+        let period = cell * 2
+        let scroll = (phase * period * brush.resolvedCheckerCyclesPerLoop)
+            .truncatingRemainder(dividingBy: period)
+        let band = CGMutablePath()
+        appendRibbon(
+            from: 0,
+            through: geometry.total,
+            geometry: geometry,
+            roundedCaps: brush.resolvedEndStyle == .rounded,
+            to: band
+        )
+        context.saveGState()
+        context.addPath(band)
+        context.clip()
+        let palette = [
+            brush.color,
+            brush.resolvedDashBackgroundColor,
+            brush.resolvedTertiaryColor,
+            brush.resolvedQuaternaryColor
+        ]
+        let capReach = max(
+            cell,
+            Double(geometry.halfWidths.first ?? 0),
+            Double(geometry.halfWidths.last ?? 0)
+        )
+        var column = Int(Foundation.floor((-capReach - scroll) / cell)) - 1
+        var along = scroll + (Double(column) + 0.5) * cell
+        while along - cell / 2 <= geometry.total + capReach {
+            for row in 0..<2 {
+                let parity = ((column % 2) + 2) % 2
+                let paletteIndex = parity + row * 2
+                context.setFillColor(uiColor(palette[paletteIndex], opacity: brush.opacity).cgColor)
+                drawCell(center: along, row: row, cell: cell, geometry: geometry, in: context)
+            }
+            column += 1
+            along += cell
+        }
+        context.restoreGState()
+    }
+
+    private func drawCell(
+        center: Double,
+        row: Int,
+        cell: Double,
+        geometry: Geometry,
+        in context: CGContext
+    ) {
+        let distance = min(geometry.total, max(0, center))
+        guard let station = station(at: distance, geometry: geometry) else { return }
+        let tangent = station.tangent
+        let normal = CGPoint(x: -tangent.y, y: tangent.x)
+        let half = cell / 2
+        // Match Metal's across convention: row 0 is below the centerline and
+        // row 1 is above it in the app's top-left canvas coordinate system.
+        let rowOffset = row == 0 ? half : -half
+        let longitudinalOffset = center - distance
+        let c = CGPoint(
+            x: station.center.x + tangent.x * longitudinalOffset + normal.x * rowOffset,
+            y: station.center.y + tangent.y * longitudinalOffset + normal.y * rowOffset
+        )
+        let path = CGMutablePath()
+        let corners: [CGPoint] = [
+            CGPoint(x: c.x + tangent.x * -half + normal.x * -half, y: c.y + tangent.y * -half + normal.y * -half),
+            CGPoint(x: c.x + tangent.x * half + normal.x * -half, y: c.y + tangent.y * half + normal.y * -half),
+            CGPoint(x: c.x + tangent.x * half + normal.x * half, y: c.y + tangent.y * half + normal.y * half),
+            CGPoint(x: c.x + tangent.x * -half + normal.x * half, y: c.y + tangent.y * -half + normal.y * half)
+        ]
+        path.move(to: corners[0])
+        for corner in corners.dropFirst() { path.addLine(to: corner) }
+        path.closeSubpath()
+        context.addPath(path)
+        context.fillPath()
+    }
+
+    private struct Station {
+        var center: CGPoint
+        var upper: CGPoint
+        var lower: CGPoint
+        var tangent: CGPoint
+        var halfWidth: CGFloat
+    }
+
+    private func makeGeometry(samples: [StrokeSample], brush: BrushSettings) -> Geometry? {
+        let centers = samples.map(\.point)
+        guard centers.count > 1 else { return nil }
+        var upper: [CGPoint] = []
+        var lower: [CGPoint] = []
+        var halfWidths: [CGFloat] = []
+        var cumulative = [0.0]
+        var total = 0.0
+        for index in centers.indices {
+            let previous = centers[max(0, index - 1)]
+            let next = centers[min(centers.count - 1, index + 1)]
+            let length = max(0.001, hypot(next.x - previous.x, next.y - previous.y))
+            let normal = CGPoint(x: -(next.y - previous.y) / length, y: (next.x - previous.x) / length)
+            let halfWidth = brush.size / 2
+            halfWidths.append(halfWidth)
+            upper.append(CGPoint(x: centers[index].x + normal.x * halfWidth, y: centers[index].y + normal.y * halfWidth))
+            lower.append(CGPoint(x: centers[index].x - normal.x * halfWidth, y: centers[index].y - normal.y * halfWidth))
+            if index > 0 {
+                total += hypot(centers[index].x - centers[index - 1].x, centers[index].y - centers[index - 1].y)
+                cumulative.append(total)
+            }
+        }
+        return Geometry(
+            centers: centers,
+            upper: upper,
+            lower: lower,
+            halfWidths: halfWidths,
+            cumulative: cumulative,
+            total: total
+        )
+    }
+
+    private func station(at distance: Double, geometry: Geometry) -> Station? {
+        guard geometry.centers.count > 1 else { return nil }
+        let distance = min(geometry.total, max(0, distance))
+        var index = 1
+        while index < geometry.cumulative.count && geometry.cumulative[index] < distance { index += 1 }
+        index = min(geometry.centers.count - 1, index)
+        let start = geometry.cumulative[index - 1]
+        let segment = max(0.001, geometry.cumulative[index] - start)
+        let progress = min(1, max(0, (distance - start) / segment))
+        let a = geometry.centers[index - 1]
+        let b = geometry.centers[index]
+        let direction = CGPoint(x: b.x - a.x, y: b.y - a.y)
+        let directionLength = max(0.001, hypot(direction.x, direction.y))
+        let tangent = CGPoint(x: direction.x / directionLength, y: direction.y / directionLength)
+        return Station(
+            center: interpolate(geometry.centers[index - 1], geometry.centers[index], progress),
+            upper: interpolate(geometry.upper[index - 1], geometry.upper[index], progress),
+            lower: interpolate(geometry.lower[index - 1], geometry.lower[index], progress),
+            tangent: tangent,
+            halfWidth: geometry.halfWidths[index - 1] + (geometry.halfWidths[index] - geometry.halfWidths[index - 1]) * CGFloat(progress)
+        )
+    }
+
+    private func interpolate(_ a: CGPoint, _ b: CGPoint, _ progress: Double) -> CGPoint {
+        CGPoint(x: a.x + (b.x - a.x) * CGFloat(progress), y: a.y + (b.y - a.y) * CGFloat(progress))
+    }
+
+    private func appendRibbon(
+        from start: Double,
+        through end: Double,
+        geometry: Geometry,
+        roundedCaps: Bool,
+        to path: CGMutablePath
+    ) {
+        guard end > start else { return }
+        var distances = [start, end]
+        distances.append(contentsOf: geometry.cumulative.filter { $0 > start && $0 < end })
+        distances.sort()
+        guard distances.count > 1 else { return }
+        var stations: [Station] = []
+        for distance in distances {
+            if let current = station(at: distance, geometry: geometry) { stations.append(current) }
+        }
+        guard stations.count > 1 else { return }
+        let first = stations[0]
+        let last = stations[stations.count - 1]
+        path.move(to: first.upper)
+        for current in stations.dropFirst() { path.addLine(to: current.upper) }
+        if roundedCaps {
+            let k: CGFloat = 0.552_284_75
+            let endNormal = CGPoint(
+                x: (last.upper.x - last.center.x) / max(0.001, last.halfWidth),
+                y: (last.upper.y - last.center.y) / max(0.001, last.halfWidth)
+            )
+            let endTip = CGPoint(
+                x: last.center.x + last.tangent.x * last.halfWidth,
+                y: last.center.y + last.tangent.y * last.halfWidth
+            )
+            path.addCurve(
+                to: endTip,
+                control1: CGPoint(
+                    x: last.upper.x + last.tangent.x * last.halfWidth * k,
+                    y: last.upper.y + last.tangent.y * last.halfWidth * k
+                ),
+                control2: CGPoint(
+                    x: endTip.x + endNormal.x * last.halfWidth * k,
+                    y: endTip.y + endNormal.y * last.halfWidth * k
+                )
+            )
+            path.addCurve(
+                to: last.lower,
+                control1: CGPoint(
+                    x: endTip.x - endNormal.x * last.halfWidth * k,
+                    y: endTip.y - endNormal.y * last.halfWidth * k
+                ),
+                control2: CGPoint(
+                    x: last.lower.x + last.tangent.x * last.halfWidth * k,
+                    y: last.lower.y + last.tangent.y * last.halfWidth * k
+                )
+            )
+        } else {
+            path.addLine(to: last.lower)
+        }
+        for current in stations.dropLast().reversed() { path.addLine(to: current.lower) }
+        if roundedCaps {
+            let k: CGFloat = 0.552_284_75
+            let startNormal = CGPoint(
+                x: (first.upper.x - first.center.x) / max(0.001, first.halfWidth),
+                y: (first.upper.y - first.center.y) / max(0.001, first.halfWidth)
+            )
+            let startTip = CGPoint(
+                x: first.center.x - first.tangent.x * first.halfWidth,
+                y: first.center.y - first.tangent.y * first.halfWidth
+            )
+            path.addCurve(
+                to: startTip,
+                control1: CGPoint(
+                    x: first.lower.x - first.tangent.x * first.halfWidth * k,
+                    y: first.lower.y - first.tangent.y * first.halfWidth * k
+                ),
+                control2: CGPoint(
+                    x: startTip.x - startNormal.x * first.halfWidth * k,
+                    y: startTip.y - startNormal.y * first.halfWidth * k
+                )
+            )
+            path.addCurve(
+                to: first.upper,
+                control1: CGPoint(
+                    x: startTip.x + startNormal.x * first.halfWidth * k,
+                    y: startTip.y + startNormal.y * first.halfWidth * k
+                ),
+                control2: CGPoint(
+                    x: first.upper.x - first.tangent.x * first.halfWidth * k,
+                    y: first.upper.y - first.tangent.y * first.halfWidth * k
+                )
+            )
+        } else {
+            path.addLine(to: first.upper)
+        }
+        path.closeSubpath()
+    }
+}
+
 nonisolated struct ParticleKernel: AnimatedBrushKernel {
     let kind = BrushKind.particle
 
@@ -1975,7 +2262,13 @@ nonisolated struct ParticleKernel: AnimatedBrushKernel {
 
         let corner = brush.resolvedDashCornerRadius
         let base = CGMutablePath()
-        appendRibbon(from: 0, through: geometry.total, geometry: geometry, cornerRadius: corner, to: base)
+        appendRibbon(
+            from: 0,
+            through: geometry.total,
+            geometry: geometry,
+            cornerRadius: brush.resolvedEndStyle == .rounded ? 1 : 0,
+            to: base
+        )
         context.saveGState()
         context.setFillColor(uiColor(brush.resolvedDashBackgroundColor, opacity: brush.opacity).cgColor)
         context.addPath(base)
@@ -2179,11 +2472,13 @@ nonisolated struct DashedKernel: AnimatedBrushKernel {
 
         let geometry = makeGeometry(samples: samples, brush: brush)
         var baseSegments: [CGPath] = []
+        var baseBrush = brush
+        baseBrush.dashCornerRadius = brush.resolvedEndStyle == .rounded ? 1 : 0
         appendRibbon(
             from: 0,
             through: geometry.total,
             geometry: geometry,
-            brush: brush,
+            brush: baseBrush,
             dashStart: 0,
             dashEnd: geometry.total,
             to: &baseSegments
@@ -2196,6 +2491,10 @@ nonisolated struct DashedKernel: AnimatedBrushKernel {
         )
 
         context.saveGState()
+        let baseMask = CGMutablePath()
+        for segment in baseSegments { baseMask.addPath(segment) }
+        context.addPath(baseMask)
+        context.clip()
         context.setLineJoin(.round)
         context.setLineWidth(size)
 
@@ -2694,7 +2993,7 @@ nonisolated struct StarKernel: AnimatedBrushKernel {
         brush: BrushSettings
     ) -> CGFloat {
         let pathAngle = Foundation.atan2(station.tangent.y, station.tangent.x)
-        let spin = CGFloat(phase * Double.pi * 2 * brush.resolvedStarRotationSpeed)
+        let spin = CGFloat(phase * Double.pi * 2 * brush.resolvedStarRotationCyclesPerLoop)
         switch brush.resolvedStarRotationMode {
         case .synced:
             return pathAngle + spin
@@ -3086,11 +3385,27 @@ nonisolated struct FadedKernel: AnimatedBrushKernel {
         }
         let centerPath = geometry.centerPath
         context.saveGState()
-        context.beginTransparencyLayer(auxiliaryInfo: nil)
-        context.setStrokeColor(uiColor(brush.color, opacity: brush.opacity).cgColor)
         context.setLineWidth(brush.size)
         context.setLineCap(.round)
         context.setLineJoin(.round)
+
+        let baseOpacity = brush.opacity * brush.resolvedFadedBaseOpacity
+        if baseOpacity > 0.001 {
+            context.setStrokeColor(uiColor(
+                brush.resolvedFadedBaseColor,
+                opacity: baseOpacity
+            ).cgColor)
+            context.addPath(centerPath)
+            context.strokePath()
+        }
+
+        let textureOpacity = brush.opacity * brush.resolvedFadedTextureOpacity
+        guard textureOpacity > 0.001 else {
+            context.restoreGState()
+            return
+        }
+        context.beginTransparencyLayer(auxiliaryInfo: nil)
+        context.setStrokeColor(uiColor(brush.color, opacity: textureOpacity).cgColor)
         context.addPath(centerPath)
         context.strokePath()
 
@@ -3220,74 +3535,6 @@ nonisolated struct FadedKernel: AnimatedBrushKernel {
                 elementEstimate += 5
             }
 
-            // Partial circles bite into both outside edges, creating the torn,
-            // crusted silhouette visible in the reference frames.
-            let biteCount = Int((8 + strength * 13).rounded())
-            for bite in 0..<biteCount {
-                let key = group * 509 + bite
-                let distance = min(
-                    metrics.total,
-                    max(
-                        0,
-                        centerDistance
-                            + (seeded(frameSeed &+ 3_631, key) * 2 - 1) * groupLength / 2
-                    )
-                )
-                guard let station = station(
-                    at: distance,
-                    samples: samples,
-                    metrics: metrics
-                ) else { continue }
-                let side = seeded(frameSeed &+ 4_039, key) < 0.5 ? -1.0 : 1.0
-                let diameter = brush.size * (0.10 + seeded(frameSeed &+ 4_421, key) * 0.27)
-                let center = CGPoint(
-                    x: station.point.x + station.normal.x * side * brush.size * 0.46,
-                    y: station.point.y + station.normal.y * side * brush.size * 0.46
-                )
-                cutPath.addEllipse(in: CGRect(
-                    x: center.x - diameter / 2,
-                    y: center.y - diameter / 2,
-                    width: diameter,
-                    height: diameter
-                ))
-                elementEstimate += 6
-            }
-
-            // Dense granular pores make the transition around each broken
-            // cluster look grungy instead of like a clean vector cut.
-            let grainCount = Int((15 + strength * 28).rounded())
-            for grain in 0..<grainCount {
-                let key = group * 2_003 + grain
-                let distance = min(
-                    metrics.total,
-                    max(
-                        0,
-                        centerDistance
-                            + (seeded(frameSeed &+ 4_829, key) * 2 - 1) * groupLength * 0.62
-                    )
-                )
-                guard let station = station(
-                    at: distance,
-                    samples: samples,
-                    metrics: metrics
-                ) else { continue }
-                let across = (seeded(frameSeed &+ 5_239, key) * 2 - 1) * brush.size * 0.49
-                let center = CGPoint(
-                    x: station.point.x + station.normal.x * across,
-                    y: station.point.y + station.normal.y * across
-                )
-                let diameter = max(
-                    0.45,
-                    brush.size * (0.012 + seeded(frameSeed &+ 5_647, key) * 0.075)
-                )
-                cutPath.addEllipse(in: CGRect(
-                    x: center.x - diameter / 2,
-                    y: center.y - diameter / 2,
-                    width: diameter,
-                    height: diameter
-                ))
-                elementEstimate += 6
-            }
         }
         return CutPathBox(
             path: cutPath,
@@ -3462,6 +3709,13 @@ nonisolated struct DryOutlineKernel: AnimatedBrushKernel {
         return cache
     }()
 
+    private static let grainTileCache: NSCache<NSString, UIImage> = {
+        let cache = NSCache<NSString, UIImage>()
+        cache.countLimit = 512
+        cache.totalCostLimit = 24 * 1024 * 1024
+        return cache
+    }()
+
     func draw(stroke: AnimatedStroke, phase: Double, in context: CGContext) {
         let samples = stroke.samples
         guard samples.count > 1 else { return }
@@ -3486,9 +3740,19 @@ nonisolated struct DryOutlineKernel: AnimatedBrushKernel {
             geometry = generated
         }
 
-        // Stable pressure/taper-aware core. It never changes with animation
-        // phase, but Start Width and End Width remain fully editable per brush.
+        // Match the live Metal brush with a fine procedural edge texture and
+        // subtle dry-skip holes. This replaces thousands of animated ellipse
+        // paths, which exported as slow-moving blobs at higher frame rates.
         let coreWidth = brush.size * (0.94 - roughness * 0.08)
+        context.saveGState()
+        context.beginTransparencyLayer(auxiliaryInfo: nil)
+        drawGrainTexture(
+            stroke: stroke,
+            phase: phase,
+            geometry: geometry,
+            coreWidth: coreWidth,
+            in: context
+        )
         drawSegmentedStroke(
             points: samples.map(\.point),
             samples: samples,
@@ -3497,55 +3761,162 @@ nonisolated struct DryOutlineKernel: AnimatedBrushKernel {
             widthMultiplier: coreWidth / max(0.001, brush.size),
             roundCaps: true
         )
+        eraseDrySkipTexture(
+            stroke: stroke,
+            phase: phase,
+            geometry: geometry,
+            coreWidth: coreWidth,
+            in: context
+        )
+        context.endTransparencyLayer()
+        context.restoreGState()
+    }
 
-        guard density > 0.01, roughness > 0.01, geometry.metrics.total > 0.001 else { return }
-        let speed = brush.resolvedBorderSpeed
-        let frameCount = speed < 0.01
-            ? 1
-            : max(4, Int((5 + speed * 4).rounded()))
-        let normalizedPhase = phase - Foundation.floor(phase)
-        let globalFrame = speed < 0.01
-            ? 0
-            : min(
-                frameCount - 1,
-                Int(Foundation.floor(normalizedPhase * Double(frameCount)))
-            )
+    private func drawGrainTexture(
+        stroke: AnimatedStroke,
+        phase: Double,
+        geometry: GeometryBox,
+        coreWidth: CGFloat,
+        in context: CGContext
+    ) {
+        let brush = stroke.brush
+        guard brush.resolvedTextureDensity > 0.01,
+              brush.resolvedTextureRoughness > 0.01,
+              geometry.metrics.total > 0.001,
+              let tile = grainTile(stroke: stroke, holes: false) else { return }
+        let roughness = brush.resolvedTextureRoughness
+        let outerWidth = coreWidth * (1.04 + roughness * 0.34)
+        let tileSize = max(14, brush.size * 1.7)
+        let offset = grainOffset(
+            phase: phase,
+            speed: brush.resolvedBorderSpeed,
+            cycles: brush.loopCycles,
+            tileSize: tileSize
+        )
+
+        context.saveGState()
+        clip(centerPath: geometry.centerPath, width: outerWidth, in: context)
+        context.draw(
+            tile,
+            in: CGRect(x: offset.x, y: offset.y, width: tileSize, height: tileSize),
+            byTiling: true
+        )
+        context.restoreGState()
+    }
+
+    private func eraseDrySkipTexture(
+        stroke: AnimatedStroke,
+        phase: Double,
+        geometry: GeometryBox,
+        coreWidth: CGFloat,
+        in context: CGContext
+    ) {
+        let brush = stroke.brush
+        guard brush.resolvedTextureDensity > 0.01,
+              brush.resolvedTextureRoughness > 0.01,
+              let tile = grainTile(stroke: stroke, holes: true) else { return }
+        let tileSize = max(12, brush.size * 1.45)
+        let offset = grainOffset(
+            phase: phase + 0.37,
+            speed: brush.resolvedBorderSpeed,
+            cycles: brush.loopCycles,
+            tileSize: tileSize
+        )
+
+        context.saveGState()
+        clip(centerPath: geometry.centerPath, width: coreWidth * 0.96, in: context)
+        context.setBlendMode(.destinationOut)
+        context.draw(
+            tile,
+            in: CGRect(x: offset.x, y: offset.y, width: tileSize, height: tileSize),
+            byTiling: true
+        )
+        context.restoreGState()
+    }
+
+    private func clip(centerPath: CGPath, width: CGFloat, in context: CGContext) {
+        context.addPath(centerPath)
+        context.setLineWidth(max(0.5, width))
+        context.setLineCap(.round)
+        context.setLineJoin(.round)
+        context.replacePathWithStrokedPath()
+        context.clip()
+    }
+
+    private func grainOffset(
+        phase: Double,
+        speed: Double,
+        cycles: Int,
+        tileSize: CGFloat
+    ) -> CGPoint {
+        guard speed > 0.01 else { return .zero }
+        let cycleCount = max(1, (speed * 2).rounded()) * Double(max(1, cycles))
+        let angle = phase * 2 * Double.pi * cycleCount
+        let travel = tileSize * 0.32
+        return CGPoint(
+            x: Foundation.cos(angle) * travel,
+            y: Foundation.sin(angle) * travel
+        )
+    }
+
+    private func grainTile(stroke: AnimatedStroke, holes: Bool) -> CGImage? {
+        let brush = stroke.brush
         let strokeSeed = stableStrokeSeed(stroke.id, base: brush.seed)
-        let offset = frameCount == 1
-            ? 0
-            : Int(seeded(strokeSeed &+ 503, 0) * Double(frameCount))
-        let frameIndex = (globalFrame + offset) % frameCount
-        let frameSeed = strokeSeed
-            &+ UInt64(frameIndex + 1) &* 0xD6E8FEB86659FD93
-        let frameKey = "\(geometryKey)-\(frameIndex)-\(Int(brush.size * 10))-\(Int(density * 100))-\(Int(roughness * 100))-\(Int(brush.resolvedStartWidthScale * 100))-\(Int(brush.resolvedEndWidthScale * 100))" as NSString
-        let edgeFrame: EdgeFrameBox
-        if let cached = Self.edgeFrameCache.object(forKey: frameKey) {
-            edgeFrame = cached
-        } else {
-            let generated = makeEdgeFrame(
-                frameSeed: frameSeed,
-                brush: brush,
-                coreWidth: coreWidth,
-                metrics: geometry.metrics,
-                samples: samples
-            )
-            Self.edgeFrameCache.setObject(
-                generated,
-                forKey: frameKey,
-                cost: generated.estimatedCost
-            )
-            edgeFrame = generated
+        let key = "grain-tile-\(strokeSeed)-\(holes)-\(Int(brush.resolvedTextureDensity * 100))-\(Int(brush.resolvedTextureRoughness * 100))-\(Int(brush.color.red * 255))-\(Int(brush.color.green * 255))-\(Int(brush.color.blue * 255))-\(Int(brush.opacity * 100))" as NSString
+        if let cached = Self.grainTileCache.object(forKey: key)?.cgImage { return cached }
+
+        let side = 128
+        let density = brush.resolvedTextureDensity
+        let roughness = brush.resolvedTextureRoughness
+        var pixels = [UInt8](repeating: 0, count: side * side * 4)
+        for y in 0..<side {
+            for x in 0..<side {
+                let index = y * side + x
+                let fine = seeded(strokeSeed &+ 101, index)
+                let medium = seeded(strokeSeed &+ 307, (y / 3) * 47 + x / 3)
+                let coarse = seeded(strokeSeed &+ 701, (y / 9) * 19 + x / 9)
+                let noise = fine * 0.52 + medium * 0.31 + coarse * 0.17
+                let alpha: Double
+                if holes {
+                    let threshold = 0.79 + (1 - roughness) * 0.09 + (1 - density) * 0.05
+                    alpha = noise > threshold
+                        ? min(0.48, 0.12 + (noise - threshold) * 3.8)
+                        : 0
+                } else {
+                    let threshold = 0.35 + (1 - density) * 0.22
+                    alpha = noise > threshold
+                        ? min(1, 0.30 + (noise - threshold) * (1.5 + roughness))
+                        : 0
+                }
+                let premultipliedAlpha = alpha * brush.opacity * brush.color.alpha
+                let offset = index * 4
+                pixels[offset] = UInt8(clamping: Int(brush.color.red * premultipliedAlpha * 255))
+                pixels[offset + 1] = UInt8(clamping: Int(brush.color.green * premultipliedAlpha * 255))
+                pixels[offset + 2] = UInt8(clamping: Int(brush.color.blue * premultipliedAlpha * 255))
+                pixels[offset + 3] = UInt8(clamping: Int(premultipliedAlpha * 255))
+            }
         }
 
-        let alphaLevels = [0.55, 0.78, 0.92, 1.0]
-        for (index, path) in edgeFrame.paths.enumerated() where !path.isEmpty {
-            context.setFillColor(uiColor(
-                brush.color,
-                opacity: brush.opacity * alphaLevels[index]
-            ).cgColor)
-            context.addPath(path)
-            context.fillPath()
-        }
+        guard let provider = CGDataProvider(data: Data(pixels) as CFData),
+              let image = CGImage(
+                width: side,
+                height: side,
+                bitsPerComponent: 8,
+                bitsPerPixel: 32,
+                bytesPerRow: side * 4,
+                space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue),
+                provider: provider,
+                decode: nil,
+                shouldInterpolate: false,
+                intent: .defaultIntent
+              ) else { return nil }
+        Self.grainTileCache.setObject(
+            UIImage(cgImage: image),
+            forKey: key,
+            cost: pixels.count
+        )
+        return image
     }
 
     private func makeEdgeFrame(
@@ -4100,7 +4471,13 @@ nonisolated struct ColorNoiseKernel: AnimatedBrushKernel {
 }
 
 nonisolated struct GradientKernel: AnimatedBrushKernel {
-    let kind = BrushKind.gradient
+    let kind: BrushKind
+    let animates: Bool
+
+    init(kind: BrushKind = .gradient, animates: Bool = true) {
+        self.kind = kind
+        self.animates = animates
+    }
 
     func draw(stroke: AnimatedStroke, phase: Double, in context: CGContext) {
         let samples = stroke.samples
@@ -4126,14 +4503,14 @@ nonisolated struct GradientKernel: AnimatedBrushKernel {
         let maxY = points.map(\.y).max() ?? minY + 1
         let horizontal = maxX - minX >= maxY - minY
         let normalizedPhase = phase - Foundation.floor(phase)
-        let speed = brush.resolvedGradientSpeed
-        let cycles = speed < 0.01
-            ? 0
-            : max(1, Int((speed * 2).rounded()))
+        let cycles = animates ? Int(brush.resolvedGradientCyclesPerLoop) : 0
         let flow = cycles == 0
             ? 0
             : Foundation.sin(normalizedPhase * Double.pi * 2 * Double(cycles)) * 0.28
         let stopCount = 9
+        let secondColor = kind == .solidColor && !brush.resolvedColoringUsesGradient
+            ? brush.color
+            : brush.resolvedSecondaryColor
         var colors: [CGColor] = []
         var locations: [CGFloat] = []
         colors.reserveCapacity(stopCount)
@@ -4143,7 +4520,7 @@ nonisolated struct GradientKernel: AnimatedBrushKernel {
             let location = Double(index) / Double(stopCount - 1)
             let blend = min(1, max(0, location + flow))
             colors.append(uiColor(
-                mixedColor(brush.color, brush.resolvedSecondaryColor, amount: blend),
+                mixedColor(brush.color, secondColor, amount: blend),
                 opacity: brush.opacity
             ).cgColor)
             locations.append(CGFloat(location))
@@ -4195,6 +4572,81 @@ nonisolated struct GradientKernel: AnimatedBrushKernel {
             return path
         }
 
+        let firstMidpoint = CGPoint(
+            x: (samples[0].x + samples[1].x) / 2,
+            y: (samples[0].y + samples[1].y) / 2
+        )
+        path.addLine(to: firstMidpoint)
+        for index in 1..<(samples.count - 1) {
+            let control = samples[index].point
+            let next = samples[index + 1].point
+            path.addQuadCurve(
+                to: CGPoint(
+                    x: (control.x + next.x) / 2,
+                    y: (control.y + next.y) / 2
+                ),
+                control: control
+            )
+        }
+        if let last = samples.last?.point {
+            path.addQuadCurve(to: last, control: last)
+        }
+        return path
+    }
+}
+
+nonisolated struct RetroKernel: AnimatedBrushKernel {
+    let kind = BrushKind.retro
+
+    func draw(stroke: AnimatedStroke, phase: Double, in context: CGContext) {
+        let samples = stroke.samples
+        guard samples.count > 1 else { return }
+        let brush = stroke.brush
+        let centerPath = smoothedCenterPath(samples)
+
+        context.saveGState()
+        context.addPath(centerPath)
+        context.setLineWidth(brush.size)
+        context.setLineCap(.round)
+        context.setLineJoin(.round)
+        context.replacePathWithStrokedPath()
+        context.clip()
+
+        let normalizedPhase = phase - Foundation.floor(phase)
+        let cycles = brush.resolvedGradientCyclesPerLoop
+        let wrapped = (normalizedPhase * cycles).truncatingRemainder(dividingBy: 1)
+        let count = brush.resolvedTrippyColorCount
+        let index = cycles == 0
+            ? 0
+            : min(count - 1, Int(floor(wrapped * Double(count))))
+        let palette = [
+            brush.color,
+            brush.resolvedSecondaryColor,
+            brush.resolvedTertiaryColor,
+            brush.resolvedQuaternaryColor,
+            brush.resolvedQuinaryColor
+        ]
+
+        // The whole stroke is one solid color at a time, stepping through the
+        // palette in order as the animation plays.
+        context.addPath(centerPath)
+        context.setLineWidth(brush.size)
+        context.setLineCap(.round)
+        context.setLineJoin(.round)
+        context.replacePathWithStrokedPath()
+        context.setFillColor(uiColor(palette[index], opacity: brush.opacity).cgColor)
+        context.fillPath()
+        context.restoreGState()
+    }
+
+    private func smoothedCenterPath(_ samples: [StrokeSample]) -> CGMutablePath {
+        let path = CGMutablePath()
+        guard let first = samples.first?.point else { return path }
+        path.move(to: first)
+        guard samples.count > 2 else {
+            if let last = samples.last?.point { path.addLine(to: last) }
+            return path
+        }
         let firstMidpoint = CGPoint(
             x: (samples[0].x + samples[1].x) / 2,
             y: (samples[0].y + samples[1].y) / 2
@@ -4588,7 +5040,8 @@ nonisolated enum AnimatedDrawingRenderer {
         transparent: Bool = false,
         showTransparencyGrid: Bool = false,
         randomizeStrokePhase: Bool = false,
-        previewStroke: AnimatedStroke? = nil
+        previewStroke: AnimatedStroke? = nil,
+        previewLayerOpacity: Double = 1
     ) -> CGImage? {
         let target = outputSize ?? CGSize(width: document.width, height: document.height)
         guard target.width > 0, target.height > 0 else { return nil }
@@ -4602,6 +5055,9 @@ nonisolated enum AnimatedDrawingRenderer {
             space: colorSpace,
             bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
         ) else { return nil }
+        context.interpolationQuality = .high
+        context.setAllowsAntialiasing(true)
+        context.setShouldAntialias(true)
 
         context.translateBy(x: 0, y: target.height)
         context.scaleBy(
@@ -4637,29 +5093,130 @@ nonisolated enum AnimatedDrawingRenderer {
                 drawFill(fill, document: document, phase: phase, in: context)
             }
             for stroke in layer.strokes {
+                let renderedStroke = globallyWavedStroke(
+                    stroke,
+                    phase: phase
+                )
                 let effectivePhase = randomizeStrokePhase
                     ? (phase + Self.strokePhaseOffset(stroke.id)).truncatingRemainder(dividingBy: 1)
                     : phase
-                BrushKernelRegistry.kernels[stroke.brush.kind]?.draw(
-                    stroke: stroke,
+                context.saveGState()
+                clipCutEnds(of: renderedStroke, in: context)
+                BrushKernelRegistry.kernels[renderedStroke.brush.kind]?.draw(
+                    stroke: renderedStroke,
                     phase: effectivePhase,
                     in: context
                 )
+                context.restoreGState()
             }
             context.restoreGState()
         }
 
         if let previewStroke, previewStroke.samples.count > 1 {
+            let renderedStroke = globallyWavedStroke(
+                previewStroke,
+                phase: phase
+            )
+            context.saveGState()
+            context.setAlpha(previewLayerOpacity)
             let effectivePhase = randomizeStrokePhase
                 ? (phase + Self.strokePhaseOffset(previewStroke.id)).truncatingRemainder(dividingBy: 1)
                 : phase
-            BrushKernelRegistry.kernels[previewStroke.brush.kind]?.draw(
-                stroke: previewStroke,
+            clipCutEnds(of: renderedStroke, in: context)
+            BrushKernelRegistry.kernels[renderedStroke.brush.kind]?.draw(
+                stroke: renderedStroke,
                 phase: effectivePhase,
                 in: context
             )
+            context.restoreGState()
         }
         return context.makeImage()
+    }
+
+    /// Shared CPU/export equivalent of the Metal vertex wave. At zero this
+    /// returns the original stroke without allocating or touching its samples.
+    private static func globallyWavedStroke(
+        _ stroke: AnimatedStroke,
+        phase: Double
+    ) -> AnimatedStroke {
+        let strength = stroke.brush.resolvedWaveAmount / 100
+        guard strength > 0.0001,
+              stroke.brush.kind.supportsGlobalWave,
+              stroke.samples.count > 1 else { return stroke }
+
+        let points = stroke.samples.map(\.point)
+        var distances = [Double](repeating: 0, count: points.count)
+        for index in 1..<points.count {
+            distances[index] = distances[index - 1] + Foundation.hypot(
+                points[index].x - points[index - 1].x,
+                points[index].y - points[index - 1].y
+            )
+        }
+        let totalLength = distances.last ?? 0
+        guard totalLength > 0.001 else { return stroke }
+
+        let amplitude = strength * max(8, stroke.brush.size * 0.55)
+        let wavelength = max(72, stroke.brush.size * 5)
+        let timeAngle = phase * Double.pi * 2
+        var result = stroke
+        for index in points.indices {
+            let previous = points[max(0, index - 1)]
+            let next = points[min(points.count - 1, index + 1)]
+            let dx = next.x - previous.x
+            let dy = next.y - previous.y
+            let length = max(0.001, Foundation.hypot(dx, dy))
+            let normalX = -dy / length
+            let normalY = dx / length
+            let progress = min(1, max(0, distances[index] / totalLength))
+            let envelope = Foundation.pow(max(0, Foundation.sin(Double.pi * progress)), 0.35)
+            let spatialAngle = distances[index] / wavelength * Double.pi * 2
+            let offset = Foundation.sin(spatialAngle - timeAngle) * amplitude * envelope
+            result.samples[index].x += normalX * offset
+            result.samples[index].y += normalY * offset
+        }
+        return result
+    }
+
+    /// Intersects the drawing context with the two endpoint tangent planes.
+    /// This removes round/particle overhang without changing the brush body.
+    private static func clipCutEnds(of stroke: AnimatedStroke, in context: CGContext) {
+        guard stroke.brush.resolvedEndStyle == .cut,
+              stroke.samples.count > 1 else { return }
+        let points = stroke.samples.map(\.point)
+        guard let startIndex = points.indices.dropFirst().first(where: {
+            Foundation.hypot(points[$0].x - points[0].x, points[$0].y - points[0].y) > 0.001
+        }),
+        let endIndex = points.indices.dropLast().reversed().first(where: {
+            Foundation.hypot(points[points.count - 1].x - points[$0].x,
+                             points[points.count - 1].y - points[$0].y) > 0.001
+        }) else { return }
+
+        func clipHalfPlane(origin: CGPoint, toward direction: CGPoint) {
+            let length = max(0.001, Foundation.hypot(direction.x, direction.y))
+            let tangent = CGPoint(x: direction.x / length, y: direction.y / length)
+            let normal = CGPoint(x: -tangent.y, y: tangent.x)
+            let reach: CGFloat = 1_000_000
+            let path = CGMutablePath()
+            path.move(to: CGPoint(x: origin.x + normal.x * reach, y: origin.y + normal.y * reach))
+            path.addLine(to: CGPoint(x: origin.x - normal.x * reach, y: origin.y - normal.y * reach))
+            path.addLine(to: CGPoint(x: origin.x - normal.x * reach + tangent.x * reach,
+                                     y: origin.y - normal.y * reach + tangent.y * reach))
+            path.addLine(to: CGPoint(x: origin.x + normal.x * reach + tangent.x * reach,
+                                     y: origin.y + normal.y * reach + tangent.y * reach))
+            path.closeSubpath()
+            context.addPath(path)
+            context.clip()
+        }
+
+        clipHalfPlane(
+            origin: points[0],
+            toward: CGPoint(x: points[startIndex].x - points[0].x, y: points[startIndex].y - points[0].y)
+        )
+        let end = points[points.count - 1]
+        clipHalfPlane(
+            origin: end,
+            toward: CGPoint(x: points[endIndex].x - end.x, y: points[endIndex].y - end.y)
+        )
     }
 
     private static func drawTransparencyGrid(document: WiggleDocument, in context: CGContext) {
@@ -4857,5 +5414,87 @@ nonisolated enum AnimatedDrawingRenderer {
         image.draw(in: rect, blendMode: .normal, alpha: opacity)
         UIGraphicsPopContext()
         context.restoreGState()
+    }
+}
+
+nonisolated struct OutlineFillKernel: AnimatedBrushKernel {
+    let kind = BrushKind.outlineFill
+
+    func draw(stroke: AnimatedStroke, phase: Double, in context: CGContext) {
+        let samples = stroke.bakedSamples()
+        guard samples.count > 1 else { return }
+        let brush = stroke.brush
+        let points = samples.map(\.point)
+        let wobbled = wobbledPoints(points, brush: brush, phase: phase)
+        guard wobbled.count > 1 else { return }
+
+        let fillWidth = brush.size
+        let outlineWidth = max(0.5, brush.resolvedOutlineWidth * 2)
+        let outlineColor = uiColor(brush.color, opacity: brush.opacity)
+        let fillColor = uiColor(brush.resolvedSecondaryColor, opacity: brush.opacity)
+
+        let path = CGMutablePath()
+        path.move(to: wobbled[0])
+        for point in wobbled.dropFirst() {
+            path.addLine(to: point)
+        }
+
+        context.saveGState()
+        context.setLineCap(.round)
+        context.setLineJoin(.round)
+        context.setStrokeColor(outlineColor.cgColor)
+        context.setLineWidth(fillWidth + outlineWidth)
+        context.addPath(path)
+        context.strokePath()
+        context.setStrokeColor(fillColor.cgColor)
+        context.setLineWidth(fillWidth)
+        context.addPath(path)
+        context.strokePath()
+        context.restoreGState()
+    }
+
+    private func wobbledPoints(_ points: [CGPoint], brush: BrushSettings, phase: Double) -> [CGPoint] {
+        let amount = CGFloat(brush.resolvedWobbleAmount)
+        let speed = CGFloat(brush.resolvedWobbleSpeed)
+        guard amount > 0.001 else { return points }
+        let halfWidth = brush.size / 2
+        var distances: [CGFloat] = []
+        distances.reserveCapacity(points.count)
+        var total: CGFloat = 0
+        for index in points.indices {
+            if index > 0 {
+                total += hypot(
+                    points[index].x - points[index - 1].x,
+                    points[index].y - points[index - 1].y
+                )
+            }
+            distances.append(total)
+        }
+        guard total > 0.001 else { return points }
+        var seedHash: CGFloat = 0
+        for byte in [UInt8(truncatingIfNeeded: brush.seed), UInt8(truncatingIfNeeded: brush.seed >> 8)] {
+            seedHash = fract(seedHash + CGFloat(byte) * 0.13758329)
+        }
+        let wavelength = max(24, halfWidth * 2)
+        let amplitude = amount * max(4, halfWidth * 0.9)
+        var wobbled: [CGPoint] = []
+        wobbled.reserveCapacity(points.count)
+        for index in points.indices {
+            let previous = points[max(0, index - 1)]
+            let next = points[min(points.count - 1, index + 1)]
+            let dx = next.x - previous.x
+            let dy = next.y - previous.y
+            let length = max(0.001, hypot(dx, dy))
+            let normal = CGPoint(x: -dy / length, y: dx / length)
+            let spatial = distances[index] / wavelength * 2 * .pi
+            let envelope = pow(max(0, sin(.pi * min(1, max(0, distances[index] / total)))), 0.25)
+            let offset = sin(spatial + CGFloat(phase) * 2 * .pi * speed + seedHash) * amplitude * envelope
+            wobbled.append(CGPoint(x: points[index].x + normal.x * offset, y: points[index].y + normal.y * offset))
+        }
+        return wobbled
+    }
+
+    private func fract(_ value: CGFloat) -> CGFloat {
+        value - floor(value)
     }
 }

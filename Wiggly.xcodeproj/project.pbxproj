@@ -8,10 +8,12 @@
 
 /* Begin PBXBuildFile section */
 		AA0000013019000000000001 /* ZIPFoundation in Frameworks */ = {isa = PBXBuildFile; productRef = AA0000023019000000000001 /* ZIPFoundation */; };
+		AA0000103019000000000010 /* ThirdParty/Gifski.xcframework in Frameworks */ = {isa = PBXBuildFile; fileRef = AA0000113019000000000011 /* ThirdParty/Gifski.xcframework */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
 		6563EDB43018E790004E2B22 /* Wiggly.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Wiggly.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		AA0000113019000000000011 /* ThirdParty/Gifski.xcframework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.xcframework; path = ThirdParty/Gifski.xcframework; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */
@@ -27,6 +29,7 @@
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				AA0000103019000000000010 /* ThirdParty/Gifski.xcframework in Frameworks */,
 				AA0000013019000000000001 /* ZIPFoundation in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
@@ -38,6 +41,7 @@
 			isa = PBXGroup;
 			children = (
 				6563EDB63018E790004E2B22 /* Wiggly */,
+				AA0000113019000000000011 /* ThirdParty/Gifski.xcframework */,
 				6563EDB53018E790004E2B22 /* Products */,
 			);
 			sourceTree = "<group>";
@@ -266,6 +270,7 @@
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_KEY_NSPhotoLibraryAddUsageDescription = "Save your exported drawings and animations to your Photos library.";
+				INFOPLIST_KEY_NSPhotoLibraryUsageDescription = "Wiggly needs Photos access to save exported drawings and animations.";
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
 				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
 				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
@@ -299,6 +304,7 @@
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_KEY_NSPhotoLibraryAddUsageDescription = "Save your exported drawings and animations to your Photos library.";
+				INFOPLIST_KEY_NSPhotoLibraryUsageDescription = "Wiggly needs Photos access to save exported drawings and animations.";
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
 				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
 				INFOPLIST_KEY_UILaunchScreen_Generation = YES;

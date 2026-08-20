@@ -5,11 +5,14 @@ struct EditorView: View {
     @Environment(\.dismiss) private var dismiss
     @ObservedObject var library: ProjectLibrary
     @StateObject private var editor: EditorModel
-    @StateObject private var brushStore = BrushPresetStore()
+    @StateObject private var brushStore: BrushPresetStore
     @State private var presentedPanel: Panel?
     @State private var showsLayers: Bool
     @State private var showsBrushStudio = false
     @State private var showsColorPicker = false
+    @State private var showsFolderDrawNotice = false
+    @AppStorage("wigglyGlobalSmoothness") private var globalSmoothness: Double = 0
+    @AppStorage("wigglyAnimationPlaybackSpeed") private var animationPlaybackSpeed: Double = 1
 
     enum Panel: String, Identifiable {
         case export
@@ -19,7 +22,12 @@ struct EditorView: View {
 
     init(document: WiggleDocument, library: ProjectLibrary, showLayersInitially: Bool = false) {
         self.library = library
-        _editor = StateObject(wrappedValue: EditorModel(document: document))
+        let brushStore = BrushPresetStore()
+        _brushStore = StateObject(wrappedValue: brushStore)
+        _editor = StateObject(wrappedValue: EditorModel(
+            document: document,
+            selectedBrush: brushStore.lastSelectedBrush
+        ))
         _showsLayers = State(initialValue: showLayersInitially)
     }
 
@@ -28,8 +36,16 @@ struct EditorView: View {
             Color(red: 0.075, green: 0.072, blue: 0.085)
                 .ignoresSafeArea()
 
-            MetalCanvas(editor: editor)
-                .ignoresSafeArea()
+            MetalCanvas(
+                editor: editor,
+                playbackSpeed: animationPlaybackSpeed,
+                onCanvasInteraction: {
+                    if showsLayers { showsLayers = false }
+                },
+                onDrawBlocked: { showsFolderDrawNotice = true },
+                onColorPickCommitted: { persistSelectedBrush() }
+            )
+            .ignoresSafeArea()
 
             VStack(spacing: 0) {
                 topBar
@@ -46,7 +62,15 @@ struct EditorView: View {
             .padding(.top, 76)
             .padding(.bottom, 18)
 
-            if editor.imageTransformMode && editor.canTransformSelectedImage {
+            HStack {
+                Spacer()
+                brushColorRail
+            }
+            .padding(.trailing, 14)
+            .padding(.top, 76)
+            .padding(.bottom, 18)
+
+            if editor.imageTransformMode && editor.canTransformSelection {
                 VStack {
                     Spacer()
                     imageTransformBar
@@ -56,56 +80,85 @@ struct EditorView: View {
             }
 
             if showsLayers {
-                Color.black.opacity(0.001)
-                    .ignoresSafeArea()
-                    .contentShape(Rectangle())
-                    .onTapGesture { showsLayers = false }
-                    .zIndex(1)
-
-                HStack {
-                    Spacer()
-                    LayersSidebar(editor: editor, isPresented: $showsLayers)
+                GeometryReader { proxy in
+                    HStack {
+                        Spacer()
+                        LayersSidebar(editor: editor, isPresented: $showsLayers)
+                            .frame(height: proxy.size.height)
+                    }
                 }
                 .padding(.trailing, 14)
-                .padding(.top, 76)
-                .padding(.bottom, 18)
+                .padding(.top, 96)
+                .padding(.bottom, 0)
                 .transition(.move(edge: .trailing).combined(with: .opacity))
                 .zIndex(2)
             }
 
             if showsBrushStudio {
-                BrushStudioView(editor: editor, store: brushStore) {
+                Color.black.opacity(0.34)
+                    .ignoresSafeArea()
+                    .contentShape(Rectangle())
+                    .onTapGesture {
+                        showsBrushStudio = false
+                    }
+                    .zIndex(10)
+
+                BrushPanelPopup(editor: editor, store: brushStore) {
                     showsBrushStudio = false
                 }
-                .transition(.opacity.combined(with: .scale(scale: 0.98)))
+                .zIndex(11)
+                .transition(.scale(scale: 0.96).combined(with: .opacity))
+            }
+
+            if presentedPanel == .export {
+                ExportView(
+                    document: editor.document,
+                    randomizeStrokePhase: editor.isStrokeAnimationRandomized
+                ) {
+                    presentedPanel = nil
+                }
+                .transition(.opacity.combined(with: .scale(scale: 0.96)))
                 .zIndex(20)
             }
+
         }
         .coordinateSpace(name: "canvasSpace")
         .animation(.snappy(duration: 0.22), value: showsLayers)
-        .animation(.easeInOut(duration: 0.2), value: showsBrushStudio)
         .interactiveDismissDisabled(true)
         .statusBarHidden(true)
         .onAppear {
             editor.onAutosave = { [weak library] in library?.scheduleAutosave($0) }
         }
         .onDisappear {
+            editor.commitTransformSelection()
             library.saveImmediately(editor.document)
         }
-        .sheet(item: $presentedPanel) { panel in
-            switch panel {
-            case .export:
-                ExportView(document: editor.document)
-            case .guide:
-                BrushGuideView()
-            }
+        .onChange(of: showsColorPicker) { _, isPresented in
+            guard !isPresented else { return }
+            persistSelectedBrush()
         }
+        .sheet(isPresented: Binding(
+            get: { presentedPanel == .guide },
+            set: { isPresented in
+                if !isPresented { presentedPanel = nil }
+            }
+        )) {
+            BrushGuideView()
+        }
+        .alert("Select a Layer", isPresented: $showsFolderDrawNotice) {
+            Button("OK", role: .cancel) {}
+        } message: {
+            Text("You can't draw on a folder. Select a layer first.")
+        }
+    }
+
+    private var isBrushActive: Bool {
+        !editor.eraserMode && !editor.selectionMode && !editor.imageTransformMode
     }
 
     private var topBar: some View {
         HStack(spacing: 8) {
             Button {
-                library.saveImmediately(editor.document)
                 dismiss()
             } label: {
                 Label("Gallery", systemImage: "chevron.backward")
@@ -120,9 +173,6 @@ struct EditorView: View {
                     }
                 }
                 Divider()
-                Button("Export Animation", systemImage: "square.and.arrow.up") {
-                    presentedPanel = .export
-                }
                 Button("Brush Guide", systemImage: "questionmark.circle") {
                     presentedPanel = .guide
                 }
@@ -134,7 +184,7 @@ struct EditorView: View {
             .accessibilityLabel("Actions")
 
             Button {
-                editor.imageTransformMode = false
+                finishTransform()
                 editor.selectionMode.toggle()
                 editor.eraserMode = false
             } label: {
@@ -143,6 +193,22 @@ struct EditorView: View {
             }
             .buttonStyle(CanvasToolButtonStyle(active: editor.selectionMode))
             .accessibilityLabel("Selection")
+
+            Button {
+                if editor.imageTransformMode {
+                    finishTransform()
+                } else if editor.canTransformSelection {
+                    editor.imageTransformMode = true
+                }
+                editor.selectionMode = false
+                editor.eraserMode = false
+                if editor.imageTransformMode { showsLayers = false }
+            } label: {
+                Image(systemName: "cursorarrow.rays")
+                    .frame(width: 22, height: 22)
+            }
+            .buttonStyle(CanvasToolButtonStyle(active: editor.imageTransformMode))
+            .accessibilityLabel("Transform selected layer or group")
 
             Spacer()
 
@@ -157,27 +223,13 @@ struct EditorView: View {
             Spacer()
 
             Button {
-                editor.imageTransformMode = false
-                editor.eraserMode = false
-                editor.selectionMode = false
-                showsBrushStudio = true
+                presentedPanel = .export
             } label: {
-                Image(systemName: editor.selectedBrush.kind.symbol)
+                Image(systemName: "square.and.arrow.up")
                     .frame(width: 22, height: 22)
             }
-            .buttonStyle(CanvasToolButtonStyle(active: !editor.eraserMode && !editor.selectionMode && !editor.imageTransformMode))
-            .accessibilityLabel("Brush Studio")
-
-            Button {
-                editor.imageTransformMode = false
-                editor.eraserMode.toggle()
-                editor.selectionMode = false
-            } label: {
-                Image(systemName: "eraser")
-                    .frame(width: 22, height: 22)
-            }
-            .buttonStyle(CanvasToolButtonStyle(active: editor.eraserMode))
-            .accessibilityLabel("Eraser")
+            .buttonStyle(CanvasToolButtonStyle(active: presentedPanel == .export))
+            .accessibilityLabel("Export animation")
 
             Button {
                 showsLayers.toggle()
@@ -187,33 +239,136 @@ struct EditorView: View {
             }
             .buttonStyle(CanvasToolButtonStyle(active: showsLayers))
             .accessibilityLabel("Layers")
-
-            Circle()
-                .fill(editor.selectedBrush.color.swiftUIColor)
-                .stroke(.white.opacity(0.85), lineWidth: 2)
-                .frame(width: 32, height: 32)
-                .padding(7)
-                .contentShape(Rectangle())
-                .onTapGesture { showsColorPicker = true }
-                .popover(isPresented: $showsColorPicker, arrowEdge: .top) {
-                    DirectColorPicker(color: $editor.selectedBrush.color)
-                        .frame(width: 420, height: 590)
-                        .presentationCompactAdaptation(.popover)
-                }
-                .accessibilityLabel("Brush Color")
-                .accessibilityHint("Tap to edit colors. Touch and hold the canvas to sample a color.")
         }
         .padding(6)
-        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+        .background(Color(red: 0.15, green: 0.15, blue: 0.17), in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 16, style: .continuous)
+                .stroke(.white.opacity(0.10), lineWidth: 1)
+        }
         .environment(\.colorScheme, .dark)
+    }
+
+    private var brushColorRail: some View {
+        VStack(spacing: 10) {
+            ForEach(editor.availableColorSlots, id: \.self) { slot in
+                brushColorButton(
+                    color: editor.selectedBrushColor(for: slot),
+                    slot: slot,
+                    label: colorSlotLabel(slot)
+                )
+            }
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 10)
+        .background(Color(red: 0.15, green: 0.15, blue: 0.17), in: RoundedRectangle(cornerRadius: 18, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 18, style: .continuous)
+                .stroke(.white.opacity(0.10), lineWidth: 1)
+        }
+        .environment(\.colorScheme, .dark)
+        .popover(isPresented: $showsColorPicker, arrowEdge: .trailing) {
+            DirectColorPicker(color: selectedColorBinding)
+                .frame(width: 340, height: 390)
+                .presentationCompactAdaptation(.popover)
+        }
+    }
+
+    private func colorSlotLabel(_ slot: BrushColorSlot) -> String {
+        if editor.selectedBrush.kind == .retro || editor.selectedBrush.kind == .checker {
+            switch slot {
+            case .primary: return "Color 1"
+            case .secondary: return "Color 2"
+            case .tertiary: return "Color 3"
+            case .quaternary: return "Color 4"
+            case .quinary: return "Color 5"
+            }
+        }
+        switch slot {
+        case .primary:
+            switch editor.selectedBrush.kind {
+            case .particle: return "Particle"
+            case .goo: return "Goo"
+            case .scribbles: return "Scribble"
+            case .particleCloud: return "Drizzle"
+            case .glitter: return "Glitter"
+            case .solidColor, .gradient: return "Color 1"
+            case .faded: return "Faded"
+            case .dryOutline: return "Ink"
+            case .star: return "Star"
+            default: return "Dash"
+            }
+        case .secondary:
+            switch editor.selectedBrush.kind {
+            case .faded: return "Base"
+            case .glitter: return "Background"
+            case .solidColor, .gradient: return "Color 2"
+            case .star: return "Base"
+            default: return "Base"
+            }
+        case .tertiary:
+            return editor.selectedBrush.kind == .checker ? "Color 3" : "Glow"
+        case .quaternary:
+            return "Color 4"
+        case .quinary:
+            return "Color 5"
+        }
+    }
+
+    private func brushColorButton(
+        color: CodableColor,
+        slot: BrushColorSlot,
+        label: String
+    ) -> some View {
+        Button {
+            editor.selectColorSlot(slot)
+            showsColorPicker = true
+        } label: {
+            VStack(spacing: 4) {
+                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                    .fill(color.swiftUIColor)
+                    .frame(width: 42, height: 42)
+                    .overlay {
+                        RoundedRectangle(cornerRadius: 10, style: .continuous)
+                            .stroke(
+                                editor.activeColorSlot == slot ? Color.blue : Color.white.opacity(0.72),
+                                lineWidth: editor.activeColorSlot == slot ? 3 : 1.5
+                            )
+                    }
+                    .shadow(color: .black.opacity(0.3), radius: 2, y: 1)
+
+                Text(label)
+                    .font(.caption2.weight(.semibold))
+                    .foregroundStyle(.white.opacity(0.78))
+            }
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("\(label) color")
+        .accessibilityHint("Tap to edit this brush color")
+    }
+
+    private var selectedColorBinding: Binding<CodableColor> {
+        Binding(
+            get: { editor.selectedBrushColor(for: editor.activeColorSlot) },
+            set: { editor.setSelectedBrushColor($0, for: editor.activeColorSlot) }
+        )
+    }
+
+    private func persistSelectedBrush() {
+        brushStore.saveBuiltIn(editor.selectedBrush, defaultName: editor.selectedBrush.kind.title)
+        brushStore.rememberSelection(editor.selectedBrush)
     }
 
     private var imageTransformBar: some View {
         HStack(spacing: 10) {
-            Label("Transform Image", systemImage: "arrow.up.left.and.arrow.down.right")
+            Label("Transform", systemImage: "cursorarrow.rays")
                 .font(.subheadline.weight(.semibold))
 
-            Text("Drag to move • Pinch to scale")
+            Text(editor.transformTargetTitle)
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.orange)
+
+            Text("Drag to move • Drag corners or pinch to scale")
                 .font(.caption)
                 .foregroundStyle(.white.opacity(0.6))
 
@@ -222,7 +377,7 @@ struct EditorView: View {
                 .overlay(.white.opacity(0.16))
 
             Button {
-                editor.changeSelectedImageScale(by: 0.9)
+                editor.changeTransformScale(by: 0.9)
             } label: {
                 Image(systemName: "minus.magnifyingglass")
                     .frame(width: 28, height: 28)
@@ -230,12 +385,8 @@ struct EditorView: View {
             .buttonStyle(RailButtonStyle())
             .accessibilityLabel("Zoom Image Out")
 
-            Text("\(Int((editor.selectedImageScale * 100).rounded()))%")
-                .font(.caption.monospacedDigit())
-                .frame(width: 50)
-
             Button {
-                editor.changeSelectedImageScale(by: 1.1)
+                editor.changeTransformScale(by: 1.1)
             } label: {
                 Image(systemName: "plus.magnifyingglass")
                     .frame(width: 28, height: 28)
@@ -244,12 +395,12 @@ struct EditorView: View {
             .accessibilityLabel("Zoom Image In")
 
             Button("Reset") {
-                editor.resetSelectedImageTransform()
+                editor.resetTransformSelection()
             }
             .buttonStyle(.bordered)
 
             Button("Done") {
-                editor.imageTransformMode = false
+                finishTransform()
             }
             .buttonStyle(.borderedProminent)
             .tint(.orange)
@@ -257,12 +408,18 @@ struct EditorView: View {
         .foregroundStyle(.white)
         .padding(.horizontal, 14)
         .padding(.vertical, 10)
-        .background(.ultraThinMaterial, in: Capsule())
+        .background(Color(red: 0.15, green: 0.15, blue: 0.17), in: Capsule())
         .overlay {
             Capsule().stroke(.white.opacity(0.12), lineWidth: 1)
         }
         .shadow(color: .black.opacity(0.3), radius: 18, y: 8)
         .environment(\.colorScheme, .dark)
+    }
+
+    private func finishTransform() {
+        guard editor.imageTransformMode else { return }
+        editor.commitTransformSelection()
+        editor.imageTransformMode = false
     }
 
     private var controlRail: some View {
@@ -275,7 +432,7 @@ struct EditorView: View {
                     set: { editor.selectedBrush.size = $0 }
                 ),
                 range: 1...200,
-                display: { "\(Int($0))" }
+                fractionDigits: 0
             )
 
             VerticalBrushControl(
@@ -286,8 +443,48 @@ struct EditorView: View {
                     set: { editor.selectedBrush.opacity = $0 }
                 ),
                 range: 0.05...1,
-                display: { "\(Int($0 * 100))%" }
+                fractionDigits: 0,
+                suffix: "%",
+                valueScale: 100
             )
+
+            VerticalBrushControl(
+                title: "Smooth",
+                systemImage: "water.waves",
+                value: $globalSmoothness,
+                range: 0...1,
+                fractionDigits: 0,
+                suffix: "%",
+                valueScale: 100
+            )
+            .accessibilityLabel("Global smoothness")
+            .accessibilityHint("Smooths every brush's strokes")
+
+            Button {
+                if isBrushActive {
+                    showsBrushStudio = true
+                } else {
+                    finishTransform()
+                    editor.eraserMode = false
+                    editor.selectionMode = false
+                }
+            } label: {
+                Image(systemName: "pencil.tip")
+                    .frame(width: 28, height: 28)
+            }
+            .buttonStyle(RailButtonStyle(active: isBrushActive))
+            .accessibilityLabel("Select brush and edit settings")
+
+            Button {
+                finishTransform()
+                editor.eraserMode.toggle()
+                editor.selectionMode = false
+            } label: {
+                Image(systemName: "eraser")
+                    .frame(width: 28, height: 28)
+            }
+            .buttonStyle(RailButtonStyle(active: editor.eraserMode))
+            .accessibilityLabel("Eraser")
 
             Divider()
                 .frame(width: 38)
@@ -302,6 +499,31 @@ struct EditorView: View {
             .buttonStyle(RailButtonStyle())
             .accessibilityLabel(editor.isAnimationPlaying ? "Pause animation" : "Play animation")
             .accessibilityHint("Pause animation while drawing to improve performance on complex canvases")
+
+            Menu {
+                Button("¼×  Slowest") { animationPlaybackSpeed = 0.25 }
+                Button("⅓×  Original 3s speed") { animationPlaybackSpeed = 1.0 / 3.0 }
+                Button("½×  Slow") { animationPlaybackSpeed = 0.5 }
+                Button("1×  Normal") { animationPlaybackSpeed = 1 }
+                Button("2×  Fast") { animationPlaybackSpeed = 2 }
+            } label: {
+                Text(animationPlaybackSpeedLabel)
+                    .font(.caption2.monospacedDigit().weight(.bold))
+                    .frame(width: 32, height: 28)
+            }
+            .buttonStyle(RailButtonStyle(active: animationPlaybackSpeed != 1))
+            .accessibilityLabel("Global animation speed \(animationPlaybackSpeedLabel)")
+            .accessibilityHint("Choose quarter, half, normal, or double speed")
+
+            Button {
+                editor.isStrokeAnimationRandomized.toggle()
+            } label: {
+                Image(systemName: "shuffle")
+                    .frame(width: 28, height: 28)
+            }
+            .buttonStyle(RailButtonStyle(active: editor.isStrokeAnimationRandomized))
+            .accessibilityLabel(editor.isStrokeAnimationRandomized ? "Random stroke animation" : "Synced stroke animation")
+            .accessibilityHint("Random gives each stroke its own animation timing; synced animates every stroke together")
 
             Button(action: editor.undo) {
                 Image(systemName: "arrow.uturn.backward")
@@ -322,9 +544,22 @@ struct EditorView: View {
         .frame(width: 54)
         .padding(.vertical, 12)
         .padding(.horizontal, 6)
-        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
+        .background(Color(red: 0.15, green: 0.15, blue: 0.17), in: RoundedRectangle(cornerRadius: 18, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 18, style: .continuous)
+                .stroke(.white.opacity(0.10), lineWidth: 1)
+        }
         .environment(\.colorScheme, .dark)
     }
+
+    private var animationPlaybackSpeedLabel: String {
+        if abs(animationPlaybackSpeed - 0.25) < 0.001 { return "¼×" }
+        if abs(animationPlaybackSpeed - (1.0 / 3.0)) < 0.001 { return "⅓×" }
+        if abs(animationPlaybackSpeed - 0.5) < 0.001 { return "½×" }
+        if abs(animationPlaybackSpeed - 2) < 0.001 { return "2×" }
+        return "1×"
+    }
+
 }
 
 private struct VerticalBrushControl: View {
@@ -332,7 +567,9 @@ private struct VerticalBrushControl: View {
     let systemImage: String
     @Binding var value: Double
     let range: ClosedRange<Double>
-    let display: (Double) -> String
+    var fractionDigits = 1
+    var suffix = ""
+    var valueScale = 1.0
 
     var body: some View {
         VStack(spacing: 7) {
@@ -348,12 +585,18 @@ private struct VerticalBrushControl: View {
                 .frame(width: 30, height: 108)
                 .accessibilityLabel(title)
 
-            Text(display(value))
-                .font(.caption2.monospacedDigit())
-                .foregroundStyle(.white.opacity(0.75))
-                .frame(width: 42)
+            NumericValueButton(
+                title: title,
+                value: $value,
+                range: range,
+                fractionDigits: fractionDigits,
+                suffix: suffix,
+                valueScale: valueScale,
+                width: 48
+            )
         }
     }
+
 }
 
 private struct CanvasToolButtonStyle: ButtonStyle {
@@ -373,29 +616,27 @@ private struct CanvasToolButtonStyle: ButtonStyle {
 
 private struct RailButtonStyle: ButtonStyle {
     @Environment(\.isEnabled) private var isEnabled
+    var active = false
 
     func makeBody(configuration: Configuration) -> some View {
         configuration.label
-            .foregroundStyle(.white.opacity(isEnabled ? 0.88 : 0.25))
+            .foregroundStyle(active ? Color.orange : .white.opacity(isEnabled ? 0.88 : 0.25))
             .padding(5)
-            .background(.black.opacity(configuration.isPressed ? 0.32 : 0.12), in: RoundedRectangle(cornerRadius: 10))
+            .background(
+                active ? Color.orange.opacity(0.16) : .black.opacity(configuration.isPressed ? 0.32 : 0.12),
+                in: RoundedRectangle(cornerRadius: 10)
+            )
             .scaleEffect(configuration.isPressed ? 0.92 : 1)
     }
 }
 
-private struct DirectColorPicker: View {
+struct DirectColorPicker: View {
     @Environment(\.dismiss) private var dismiss
     @Binding var color: CodableColor
     @State private var hue: Double
     @State private var saturation: Double
     @State private var brightness: Double
     @State private var alpha: Double
-    @State private var activeControl: ColorControl?
-
-    private enum ColorControl {
-        case hue
-        case saturationBrightness
-    }
 
     private let swatches: [Color] = [
         .white, .black, .red, .orange, .yellow, .green, .cyan, .blue, .purple, .pink
@@ -420,104 +661,87 @@ private struct DirectColorPicker: View {
     }
 
     var body: some View {
-        VStack(spacing: 16) {
-            HStack {
-                Text("Colors").font(.title2.bold())
+        VStack(spacing: 12) {
+            HStack(spacing: 10) {
+                Text("Color")
+                    .font(.headline)
                 Spacer()
                 Circle()
                     .fill(selectedColor)
-                    .frame(width: 38, height: 38)
-                    .overlay(Circle().stroke(.white.opacity(0.6), lineWidth: 2))
+                    .frame(width: 34, height: 34)
+                    .overlay(Circle().stroke(.white.opacity(0.8), lineWidth: 2))
+                    .shadow(color: .black.opacity(0.35), radius: 3)
                 Button("Done") { dismiss() }
                     .buttonStyle(.borderedProminent)
+                    .controlSize(.small)
             }
 
             GeometryReader { proxy in
-                let side = min(proxy.size.width, proxy.size.height)
-                let center = CGPoint(x: side / 2, y: side / 2)
-                let ringRadius = side * 0.43
-                let innerSide = side * 0.64
-                let innerRadius = innerSide / 2
-                let hueAngle = hue * Double.pi * 2
-                let markerPoint = saturationValueMarker(
-                    center: center,
-                    innerRadius: innerRadius
-                )
-
-                ZStack {
-                    Circle()
-                        .stroke(
-                            AngularGradient(
-                                colors: [.red, .yellow, .green, .cyan, .blue, .purple, .red],
-                                center: .center
-                            ),
-                            style: StrokeStyle(lineWidth: side * 0.12)
-                        )
-
-                    Circle()
+                ZStack(alignment: .topLeading) {
+                    RoundedRectangle(cornerRadius: 12, style: .continuous)
                         .fill(Color(hue: hue, saturation: 1, brightness: 1))
                         .overlay {
-                            Circle().fill(LinearGradient(
-                                colors: [.white, .clear],
-                                startPoint: .leading,
-                                endPoint: .trailing
-                            ))
+                            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                                .fill(LinearGradient(
+                                    colors: [.white, .clear],
+                                    startPoint: .leading,
+                                    endPoint: .trailing
+                                ))
                         }
                         .overlay {
-                            Circle().fill(LinearGradient(
-                                colors: [.clear, .black],
-                                startPoint: .top,
-                                endPoint: .bottom
-                            ))
+                            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                                .fill(LinearGradient(
+                                    colors: [.clear, .black],
+                                    startPoint: .top,
+                                    endPoint: .bottom
+                                ))
                         }
-                        .frame(width: innerSide, height: innerSide)
-                        .overlay(Circle().stroke(.black.opacity(0.35), lineWidth: 6))
-
-                    Circle()
-                        .fill(Color(hue: hue, saturation: 1, brightness: 1))
-                        .overlay(Circle().stroke(.white, lineWidth: 3))
-                        .frame(width: 28, height: 28)
-                        .position(
-                            x: center.x + Foundation.cos(hueAngle) * ringRadius,
-                            y: center.y + Foundation.sin(hueAngle) * ringRadius
-                        )
-                        .shadow(color: .black.opacity(0.5), radius: 2)
 
                     Circle()
                         .fill(selectedColor)
                         .overlay(Circle().stroke(.white, lineWidth: 3))
-                        .frame(width: 28, height: 28)
-                        .position(markerPoint)
-                        .shadow(color: .black.opacity(0.5), radius: 2)
+                        .frame(width: 24, height: 24)
+                        .shadow(color: .black.opacity(0.55), radius: 2)
+                        .position(
+                            x: min(proxy.size.width - 12, max(12, saturation * proxy.size.width)),
+                            y: min(proxy.size.height - 12, max(12, (1 - brightness) * proxy.size.height))
+                        )
                 }
-                .frame(width: side, height: side)
-                .contentShape(Circle())
+                .contentShape(Rectangle())
                 .gesture(
                     DragGesture(minimumDistance: 0)
-                        .onChanged { value in
-                            if activeControl == nil {
-                                let distance = hypot(
-                                    value.startLocation.x - center.x,
-                                    value.startLocation.y - center.y
-                                )
-                                activeControl = distance > innerRadius
-                                    ? .hue
-                                    : .saturationBrightness
-                            }
-                            updateSelection(
-                                location: value.location,
-                                center: center,
-                                innerRadius: innerRadius,
-                                control: activeControl ?? .saturationBrightness
-                            )
-                        }
-                        .onEnded { _ in activeControl = nil }
+                        .onChanged { updateSaturationBrightness($0.location, size: proxy.size) }
                 )
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
-            .aspectRatio(1, contentMode: .fit)
+            .frame(height: 190)
 
-            HStack(spacing: 9) {
+            GeometryReader { proxy in
+                ZStack(alignment: .leading) {
+                    RoundedRectangle(cornerRadius: 8, style: .continuous)
+                        .fill(LinearGradient(
+                            colors: [.red, .yellow, .green, .cyan, .blue, .purple, .red],
+                            startPoint: .leading,
+                            endPoint: .trailing
+                        ))
+                    Circle()
+                        .fill(Color(hue: hue, saturation: 1, brightness: 1))
+                        .overlay(Circle().stroke(.white, lineWidth: 2))
+                        .frame(width: 22, height: 22)
+                        .shadow(color: .black.opacity(0.45), radius: 2)
+                        .position(
+                            x: min(proxy.size.width - 11, max(11, hue * proxy.size.width)),
+                            y: proxy.size.height / 2
+                        )
+                }
+                .contentShape(Rectangle())
+                .gesture(
+                    DragGesture(minimumDistance: 0)
+                        .onChanged { updateHue($0.location.x, width: proxy.size.width) }
+                )
+            }
+            .frame(height: 26)
+
+            HStack(spacing: 6) {
                 ForEach(Array(swatches.enumerated()), id: \.offset) { _, swatch in
                     Button {
                         color = CodableColor(swatch)
@@ -525,19 +749,31 @@ private struct DirectColorPicker: View {
                     } label: {
                         Circle()
                             .fill(swatch)
-                            .frame(width: 28, height: 28)
-                            .overlay(Circle().stroke(.white.opacity(0.35), lineWidth: 1))
+                            .frame(width: 24, height: 24)
+                            .overlay(Circle().stroke(.white.opacity(0.42), lineWidth: 1))
                     }
                     .buttonStyle(.plain)
                 }
             }
 
-            LabeledContent("Opacity") {
+            HStack(spacing: 10) {
+                Image(systemName: "circle.lefthalf.filled")
+                    .foregroundStyle(.secondary)
                 Slider(value: $alpha, in: 0...1)
                     .onChange(of: alpha) { _, _ in updateColor() }
+                NumericValueButton(
+                    title: "Color Opacity",
+                    value: $alpha,
+                    range: 0...1,
+                    fractionDigits: 0,
+                    suffix: "%",
+                    valueScale: 100,
+                    width: 48,
+                    arrowEdge: .trailing
+                )
             }
         }
-        .padding(20)
+        .padding(14)
         .foregroundStyle(.white)
         .background(Color(red: 0.12, green: 0.12, blue: 0.13))
         .preferredColorScheme(.dark)
@@ -547,54 +783,16 @@ private struct DirectColorPicker: View {
         Color(hue: hue, saturation: saturation, brightness: brightness, opacity: alpha)
     }
 
-    private func saturationValueMarker(
-        center: CGPoint,
-        innerRadius: CGFloat
-    ) -> CGPoint {
-        let u = saturation * 2 - 1
-        let v = 1 - brightness * 2
-        let discX = u * Foundation.sqrt(max(0, 1 - v * v / 2))
-        let discY = v * Foundation.sqrt(max(0, 1 - u * u / 2))
-        let radius = Double(max(1, innerRadius - 16))
-        return CGPoint(
-            x: center.x + discX * radius,
-            y: center.y + discY * radius
-        )
+    private func updateSaturationBrightness(_ location: CGPoint, size: CGSize) {
+        guard size.width > 0, size.height > 0 else { return }
+        saturation = min(1, max(0, location.x / size.width))
+        brightness = min(1, max(0, 1 - location.y / size.height))
+        updateColor()
     }
 
-    private func updateSelection(
-        location: CGPoint,
-        center: CGPoint,
-        innerRadius: CGFloat,
-        control: ColorControl
-    ) {
-        let dx = location.x - center.x
-        let dy = location.y - center.y
-        if control == .hue {
-            var newHue = atan2(dy, dx) / (Double.pi * 2)
-            if newHue < 0 { newHue += 1 }
-            hue = newHue
-        } else {
-            let radius = max(1, innerRadius - 16)
-            var discX = Double(dx / radius)
-            var discY = Double(dy / radius)
-            let distance = hypot(discX, discY)
-            if distance > 1 {
-                discX /= distance
-                discY /= distance
-            }
-            let rootTwo = Foundation.sqrt(2.0)
-            let u = 0.5 * (
-                Foundation.sqrt(max(0, 2 + discX * discX - discY * discY + 2 * rootTwo * discX))
-                - Foundation.sqrt(max(0, 2 + discX * discX - discY * discY - 2 * rootTwo * discX))
-            )
-            let v = 0.5 * (
-                Foundation.sqrt(max(0, 2 - discX * discX + discY * discY + 2 * rootTwo * discY))
-                - Foundation.sqrt(max(0, 2 - discX * discX + discY * discY - 2 * rootTwo * discY))
-            )
-            saturation = min(1, max(0, (u + 1) / 2))
-            brightness = min(1, max(0, (1 - v) / 2))
-        }
+    private func updateHue(_ locationX: CGFloat, width: CGFloat) {
+        guard width > 0 else { return }
+        hue = min(1, max(0, locationX / width))
         updateColor()
     }
 

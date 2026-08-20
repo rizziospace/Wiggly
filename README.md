@@ -57,7 +57,10 @@ Bug reports, performance improvements, and new loop-safe brush engines are welco
 
 ## License
 
-Licensed under the [Apache License 2.0](LICENSE).
+Licensed under the [GNU Affero General Public License v3.0 or later](LICENSE).
+
+Wiggly includes the Gifski encoder for high-quality animated GIF export. See
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for its source and license.
 
 ## Donate
 
