@@ -26,6 +26,7 @@ enum GifskiGIFEncoder {
         height: Int,
         frameCount: Int,
         framesPerSecond: Int,
+        fixedColors: [CodableColor] = [],
         frame: (Int) throws -> CGImage,
         progress: @escaping (Double) -> Void
     ) async throws {
@@ -49,6 +50,28 @@ enum GifskiGIFEncoder {
             // gifski_finish also releases the encoder. Always call it exactly
             // once, including cancellation and failed-frame paths.
             if !isFinished { _ = gifski_finish(encoder) }
+        }
+
+        // Spend more encoder work on the shared animated palette. GIF still
+        // has a hard 256-color limit, but this substantially reduces visible
+        // banding and color drift in gradients and textured strokes.
+        try check(
+            gifski_set_extra_effort(encoder, true),
+            operation: "configuring palette quality"
+        )
+        // Keep most of the 256-entry palette available for antialiasing,
+        // gradients, and textured brushes. Reserving half the palette for
+        // source colors makes detailed strokes look flat and faded.
+        for color in fixedColors.prefix(64) {
+            try check(
+                gifski_add_fixed_color(
+                    encoder,
+                    UInt8(clamping: Int((color.red * 255).rounded())),
+                    UInt8(clamping: Int((color.green * 255).rounded())),
+                    UInt8(clamping: Int((color.blue * 255).rounded()))
+                ),
+                operation: "preserving source colors"
+            )
         }
 
         try check(
@@ -106,9 +129,12 @@ enum GifskiGIFEncoder {
         Int32(result.rawValue)
     }
 
-    /// Gifski accepts top-to-bottom, unassociated RGBA. Quartz produces
-    /// premultiplied RGBA, so unpremultiply before handing the copied buffer to
-    /// the encoder. This preserves antialiased edges instead of darkening them.
+    /// Gifski accepts top-to-bottom, unassociated RGBA. Request an explicit
+    /// big-endian 32-bit RGBA bitmap here; the previous little-endian layout
+    /// was then read as RGBA, which could swap red/blue channels in GIFs.
+    /// Quartz produces premultiplied RGBA, so unpremultiply before handing the
+    /// copied buffer to the encoder. This preserves antialiased edges instead
+    /// of darkening them.
     private static func straightRGBA(
         from image: CGImage,
         width: Int,

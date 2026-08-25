@@ -130,11 +130,11 @@ enum ExportService {
             ? 0
             : Double(frame) / Double(settings.frameCount)
         var renderDocument = document
-        if settings.format == .mp4 {
+        if settings.format == .mp4 || settings.format == .gif {
             renderDocument.backgroundVisible = true
         }
         let exportsAlpha = settings.format == .movAlpha
-            || (settings.transparentBackground && settings.format != .mp4)
+            || (settings.transparentBackground && settings.format != .mp4 && settings.format != .gif)
         let outputSize = CGSize(width: settings.width, height: settings.height)
         // GIF must render directly at its final pixel size. Rendering procedural
         // grain at 2x and averaging it down erases one-pixel flecks and thin
@@ -187,7 +187,7 @@ enum ExportService {
             bitsPerComponent: 8,
             bytesPerRow: 0,
             space: CGColorSpace(name: CGColorSpace.sRGB)!,
-            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue | CGBitmapInfo.byteOrder32Little.rawValue
         ) else {
             throw ExportError.destinationCreation
         }
@@ -244,6 +244,7 @@ enum ExportService {
             height: settings.height,
             frameCount: settings.frameCount,
             framesPerSecond: settings.framesPerSecond,
+            fixedColors: gifPaletteColors(for: document),
             frame: { frame in
                 try autoreleasepool {
                     try image(
@@ -258,6 +259,30 @@ enum ExportService {
         )
         completed = true
         return url
+    }
+
+    private static func gifPaletteColors(for document: WiggleDocument) -> [CodableColor] {
+        var colors: [CodableColor] = [document.background]
+        var seen = Set<CodableColor>(colors)
+        for layer in document.layers {
+            for stroke in layer.strokes {
+                let brush = stroke.brush
+                // Only reserve colors explicitly present in the document.
+                // The resolved* accessors provide UI defaults (pink, white,
+                // cyan, etc.) for unset fields; reserving those defaults can
+                // consume most of GIF's palette without representing pixels
+                // in the artwork.
+                let candidates = [brush.color]
+                    + [brush.secondaryColor, brush.tertiaryColor,
+                       brush.quaternaryColor, brush.quinaryColor]
+                    .compactMap { $0 }
+                for color in candidates where seen.insert(color).inserted {
+                    colors.append(color)
+                    if colors.count == 64 { return colors }
+                }
+            }
+        }
+        return colors
     }
 
     private static func exportPNGSequence(

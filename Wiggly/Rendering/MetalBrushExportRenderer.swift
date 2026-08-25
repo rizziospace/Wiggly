@@ -17,6 +17,10 @@ final class MetalBrushExportRenderer {
     private let scribblesRenderer: MetalScribblesRenderer
     private let proceduralBrushRenderer: MetalProceduralBrushRenderer
     private let checkerRenderer: MetalCheckerRenderer
+    // Match the canvas render target exactly.  Brush shaders and the canvas
+    // pass provide sRGB color components as ordinary 8-bit values; using an
+    // sRGB framebuffer here applies a second transfer curve and makes GIF
+    // exports look washed out compared with the canvas.
     private let pixelFormat: MTLPixelFormat = .bgra8Unorm
 
     static func isNeeded(for document: WiggleDocument) -> Bool {
